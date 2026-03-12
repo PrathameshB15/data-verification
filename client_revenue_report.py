@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 import psycopg2
+import requests
 import stripe
 from pyairtable import Api
 
@@ -39,6 +40,9 @@ AIRTABLE_API_KEY = config.get("airtable", "AIRTABLE_API_KEY")
 AIRTABLE_BASE_ID = config.get("airtable", "AIRTABLE_BASE_ID")
 AIRTABLE_TABLE_ID = config.get("airtable", "AIRTABLE_TABLE_ID")
 AIRTABLE_VIEW_ID = config.get("airtable", "AIRTABLE_VIEW_ID")
+
+TELEGRAM_BOT_TOKEN = config.get("telegram", "BOT_TOKEN")
+TELEGRAM_CHAT_ID = config.get("telegram", "CHAT_ID")
 
 
 def get_db_connection():
@@ -233,11 +237,15 @@ def update_airtable_revenue(report_data):
         if client_id in client_to_record:
             record_id = client_to_record[client_id]
             try:
-                table.update(record_id, {
+                last_payment = data["last_payment_date"]
+                fields_to_update = {
                     "Revenue (last 30 days)": revenue,
-                    "Price Tier": price_tier
-                })
-                logger.info(f"Updated client {client_id}: ${revenue:,.2f} -> Tier ${price_tier}")
+                    "Price Tier": price_tier,
+                }
+                if last_payment != "N/A":
+                    fields_to_update["Last Payment Date"] = last_payment
+                table.update(record_id, fields_to_update)
+                logger.info(f"Updated client {client_id}: ${revenue:,.2f} -> Tier ${price_tier}, Last Payment: {last_payment}")
                 updated_count += 1
             except Exception as e:
                 logger.error(f"Error updating client {client_id}: {e}")
@@ -245,6 +253,72 @@ def update_airtable_revenue(report_data):
             logger.warning(f"Client {client_id} not found in Airtable view")
 
     return updated_count
+
+
+def send_telegram_message(message):
+    """Send a message via Telegram bot."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML",
+    }
+    try:
+        response = requests.post(url, json=payload)
+        response.raise_for_status()
+        logger.info("Telegram notification sent successfully")
+    except Exception as e:
+        logger.error(f"Error sending Telegram notification: {e}")
+
+
+def check_upcoming_payments_and_notify(report_data):
+    """
+    Check for clients with payments due in 3 days that have
+    'New Pricing Model' checked in Airtable, and send Telegram notifications.
+    """
+    api = Api(AIRTABLE_API_KEY)
+    table = api.table(AIRTABLE_BASE_ID, AIRTABLE_TABLE_ID)
+    records = table.all(view=AIRTABLE_VIEW_ID)
+
+    # Build set of client IDs with "New Pricing Model" checked
+    new_pricing_clients = set()
+    for record in records:
+        client_id = record["fields"].get("Client ID")
+        new_pricing = record["fields"].get("New Pricing Model", False)
+        if client_id and new_pricing:
+            new_pricing_clients.add(int(client_id))
+
+    # Find clients with payment due in 3 days
+    target_date = (datetime.now().date() + timedelta(days=3)).strftime("%Y-%m-%d")
+    clients_due = []
+
+    for data in report_data:
+        client_id = data["client_id"]
+        next_payment = data["next_payment_date"]
+
+        if (
+            next_payment != "N/A"
+            and next_payment == target_date
+            and client_id in new_pricing_clients
+        ):
+            clients_due.append(data)
+
+    if not clients_due:
+        logger.info("No clients with upcoming payments in 3 days under New Pricing Model")
+        return
+
+    # Build and send Telegram message
+    message = "<b>⚠️ Payment Due in 3 Days - New Pricing Model Clients</b>\n\n"
+    for client in clients_due:
+        message += (
+            f"<b>{client['client_name']}</b> (ID: {client['client_id']})\n"
+            f"  Next Payment: {client['next_payment_date']}\n"
+            f"  Last 30 Days Revenue: ${client['last_30_days_revenue']:,.2f}\n"
+            f"  Subscription: {client['subscription_url']}\n\n"
+        )
+
+    send_telegram_message(message)
+    logger.info(f"Notified about {len(clients_due)} client(s) with payments due in 3 days")
 
 
 def generate_revenue_report(max_workers=10):
@@ -376,6 +450,10 @@ def generate_revenue_report(max_workers=10):
         logger.info("=" * 70)
         logger.info(f"Airtable updated: {updated_count} records")
         logger.info("=" * 70)
+
+        # Check for upcoming payments and send Telegram notifications
+        logger.info("Checking for upcoming payments (due in 3 days)...")
+        check_upcoming_payments_and_notify(report_data)
 
         return filename
     else:
