@@ -280,13 +280,14 @@ def check_upcoming_payments_and_notify(report_data):
     table = api.table(AIRTABLE_BASE_ID, AIRTABLE_TABLE_ID)
     records = table.all(view=AIRTABLE_VIEW_ID)
 
-    # Build set of client IDs with "New Pricing Model" checked
-    new_pricing_clients = set()
+    # Build set of client IDs with "New Pricing Model" checked and their current price tier
+    new_pricing_clients = {}
     for record in records:
         client_id = record["fields"].get("Client ID")
         new_pricing = record["fields"].get("New Pricing Model", False)
         if client_id and new_pricing:
-            new_pricing_clients.add(int(client_id))
+            current_tier = record["fields"].get("Price Tier")
+            new_pricing_clients[int(client_id)] = current_tier
 
     # Find clients with payment due in 3 days
     target_date = (datetime.now().date() + timedelta(days=3)).strftime("%Y-%m-%d")
@@ -310,10 +311,14 @@ def check_upcoming_payments_and_notify(report_data):
     # Build and send Telegram message
     message = "<b>⚠️ Payment Due in 3 Days - New Pricing Model Clients</b>\n\n"
     for client in clients_due:
+        current_tier = new_pricing_clients.get(client["client_id"])
+        updated_tier = get_price_tier(client["last_30_days_revenue"])
         message += (
             f"<b>{client['client_name']}</b> (ID: {client['client_id']})\n"
             f"  Next Payment: {client['next_payment_date']}\n"
             f"  Last 30 Days Revenue: ${client['last_30_days_revenue']:,.2f}\n"
+            f"  Current Price Tier: ${current_tier}\n"
+            f"  Updated Price Tier: ${updated_tier}\n"
             f"  Subscription: {client['subscription_url']}\n\n"
         )
 
