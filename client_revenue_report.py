@@ -212,14 +212,16 @@ def process_single_client(client_data):
     }
 
 
-def update_airtable_revenue(report_data):
-    """Update Airtable records with last 30 days revenue and price tier."""
+def fetch_airtable_records():
+    """Fetch all records from Airtable view once for reuse."""
     api = Api(AIRTABLE_API_KEY)
     table = api.table(AIRTABLE_BASE_ID, AIRTABLE_TABLE_ID)
-
-    # Get all records from the specific view
     records = table.all(view=AIRTABLE_VIEW_ID)
+    return table, records
 
+
+def update_airtable_revenue(report_data, table, records):
+    """Update Airtable records with last 30 days revenue and price tier using batch updates."""
     # Create a mapping of client_id to record_id
     client_to_record = {}
     for record in records:
@@ -227,8 +229,8 @@ def update_airtable_revenue(report_data):
         if client_id:
             client_to_record[int(client_id)] = record["id"]
 
-    # Update records with revenue and price tier data
-    updated_count = 0
+    # Build batch update list
+    batch = []
     for data in report_data:
         client_id = data["client_id"]
         revenue = data["last_30_days_revenue"]
@@ -236,21 +238,27 @@ def update_airtable_revenue(report_data):
 
         if client_id in client_to_record:
             record_id = client_to_record[client_id]
-            try:
-                last_payment = data["last_payment_date"]
-                fields_to_update = {
-                    "Revenue (last 30 days)": revenue,
-                    "Price Tier": price_tier,
-                }
-                if last_payment != "N/A":
-                    fields_to_update["Last Payment Date"] = last_payment
-                table.update(record_id, fields_to_update)
-                logger.info(f"Updated client {client_id}: ${revenue:,.2f} -> Tier ${price_tier}, Last Payment: {last_payment}")
-                updated_count += 1
-            except Exception as e:
-                logger.error(f"Error updating client {client_id}: {e}")
+            last_payment = data["last_payment_date"]
+            fields_to_update = {
+                "Revenue (last 30 days)": revenue,
+                "Price Tier": price_tier,
+            }
+            if last_payment != "N/A":
+                fields_to_update["Last Payment Date"] = last_payment
+            batch.append({"id": record_id, "fields": fields_to_update})
+            logger.info(f"Queued client {client_id}: ${revenue:,.2f} -> Tier ${price_tier}, Last Payment: {last_payment}")
         else:
             logger.warning(f"Client {client_id} not found in Airtable view")
+
+    # Batch update (pyairtable handles chunking into groups of 10 internally)
+    updated_count = 0
+    if batch:
+        try:
+            table.batch_update(batch)
+            updated_count = len(batch)
+            logger.info(f"Batch updated {updated_count} records")
+        except Exception as e:
+            logger.error(f"Error in batch update: {e}")
 
     return updated_count
 
@@ -271,14 +279,11 @@ def send_telegram_message(message):
         logger.error(f"Error sending Telegram notification: {e}")
 
 
-def check_upcoming_payments_and_notify(report_data):
+def check_upcoming_payments_and_notify(report_data, records):
     """
     Check for clients with payments due in 3 days that have
     'New Pricing Model' checked in Airtable, and send Telegram notifications.
     """
-    api = Api(AIRTABLE_API_KEY)
-    table = api.table(AIRTABLE_BASE_ID, AIRTABLE_TABLE_ID)
-    records = table.all(view=AIRTABLE_VIEW_ID)
 
     # Build set of client IDs with "New Pricing Model" checked and their current price tier
     new_pricing_clients = {}
@@ -447,18 +452,23 @@ def generate_revenue_report(max_workers=10):
         total_30_days = sum(r["last_30_days_revenue"] for r in report_data)
         logger.info(f"Total Revenue (Last 30 Days): ${total_30_days:,.2f}")
 
-        # Update Airtable
+        # Fetch Airtable records once
         logger.info("=" * 70)
+        logger.info("Fetching Airtable records...")
+        table, airtable_records = fetch_airtable_records()
+        logger.info(f"Fetched {len(airtable_records)} records from Airtable")
+
+        # Update Airtable
         logger.info("Updating Airtable...")
         logger.info("=" * 70)
-        updated_count = update_airtable_revenue(report_data)
+        updated_count = update_airtable_revenue(report_data, table, airtable_records)
         logger.info("=" * 70)
         logger.info(f"Airtable updated: {updated_count} records")
         logger.info("=" * 70)
 
         # Check for upcoming payments and send Telegram notifications
         logger.info("Checking for upcoming payments (due in 3 days)...")
-        check_upcoming_payments_and_notify(report_data)
+        check_upcoming_payments_and_notify(report_data, airtable_records)
 
         return filename
     else:

@@ -349,6 +349,7 @@ def verify_data(crm, target_date=None):
         match_percentage = (db_count / crm_count) * 100
     else:
         match_percentage = 100.0 if db_count == 0 else 0.0
+        
 
     # Determine verification status
     is_verified = match_percentage >= (VERIFICATION_THRESHOLD * 100)
