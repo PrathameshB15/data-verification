@@ -146,6 +146,11 @@ def get_blob_order_data(client_id, target_date):
         combined = pd.concat(dfs, ignore_index=True)
         print(f"Total rows across all files: {len(combined)}")
 
+        # Filter to only the target date
+        target_date_str = target_date.strftime("%Y-%m-%d")
+        combined = combined[combined["DATE_OF_SALE"].astype(str) == target_date_str]
+        print(f"Rows for {target_date_str}: {len(combined)}")
+
         # Deduplicate based on unique key
         dedup_cols = ["TRANSACTION_ID", "DATE_OF_SALE", "ORDER_ID", "PRODUCT_ID", "CLIENT_ID"]
         deduped = combined.drop_duplicates(subset=dedup_cols)
@@ -245,7 +250,7 @@ def update_data_verified_status(client_id, is_verified):
         conn.close()
 
 
-def verify_data(crm, target_date=None):
+def verify_data(crm, target_date=None, dry_run=False):
     """
     Verify data through 3-step pipeline:
     Step 1: API count vs Blob count (deduplicated)
@@ -266,7 +271,8 @@ def verify_data(crm, target_date=None):
     crm_count, _ = get_crm_order_count(crm, date_str)
     if crm_count is None:
         print("FAILED: Could not fetch CRM order count")
-        update_data_verified_status(crm.CLIENT_ID, False)
+        if not dry_run:
+            update_data_verified_status(crm.CLIENT_ID, False)
         return {"status": "ERROR", "client_id": crm.CLIENT_ID, "client_name": crm.CLIENT_NAME, "date": date_str, "error": "Failed to fetch CRM order count"}
 
     print(f"CRM API Order Count: {crm_count}")
@@ -276,7 +282,8 @@ def verify_data(crm, target_date=None):
     blob_total, blob_non_test, blob_test, _ = get_blob_order_data(crm.CLIENT_ID, target_date)
     if blob_total is None:
         print("FAILED: Could not fetch blob data")
-        update_data_verified_status(crm.CLIENT_ID, False)
+        if not dry_run:
+            update_data_verified_status(crm.CLIENT_ID, False)
         return {"status": "ERROR", "client_id": crm.CLIENT_ID, "client_name": crm.CLIENT_NAME, "date": date_str, "error": "Failed to fetch blob data"}
 
     # Step 3: Compare API count with Blob count (99% threshold)
@@ -284,21 +291,24 @@ def verify_data(crm, target_date=None):
     print(f"CRM API Count:           {crm_count}")
     print(f"Blob Total (deduped):    {blob_total}")
 
+    # Blob >= API is acceptable (extra line items / products per order)
+    # Only fail if blob is missing data compared to API
     if crm_count > 0:
-        api_blob_pct = min(crm_count, blob_total) / max(crm_count, blob_total) * 100
+        api_blob_pct = (blob_total / crm_count) * 100
     else:
         api_blob_pct = 100.0 if blob_total == 0 else 0.0
 
     api_blob_pass = api_blob_pct >= (API_BLOB_THRESHOLD * 100)
-    print(f"Match Percentage:        {api_blob_pct:.2f}%")
+    print(f"Blob Coverage:           {api_blob_pct:.2f}%")
     print(f"Threshold:               {API_BLOB_THRESHOLD * 100}%")
     print(f"Status:                  {'PASS' if api_blob_pass else 'FAIL'}")
 
     if not api_blob_pass:
-        diff = abs(crm_count - blob_total)
-        print(f"Difference:              {diff}")
-        print("FAILED: API vs Blob match below threshold")
-        update_data_verified_status(crm.CLIENT_ID, False)
+        diff = crm_count - blob_total
+        print(f"Missing in Blob:         {diff}")
+        print("FAILED: Blob coverage below threshold")
+        if not dry_run:
+            update_data_verified_status(crm.CLIENT_ID, False)
         return {
             "status": "FAIL",
             "client_id": crm.CLIENT_ID,
@@ -316,7 +326,8 @@ def verify_data(crm, target_date=None):
     db_count = get_db_order_count(crm.CLIENT_ID, date_str)
     if db_count is None:
         print("FAILED: Could not fetch database order count")
-        update_data_verified_status(crm.CLIENT_ID, False)
+        if not dry_run:
+            update_data_verified_status(crm.CLIENT_ID, False)
         return {"status": "ERROR", "client_id": crm.CLIENT_ID, "client_name": crm.CLIENT_NAME, "date": date_str, "error": "Failed to fetch database order count"}
 
     print(f"Blob Non-Test Count:     {blob_non_test}")
@@ -344,7 +355,8 @@ def verify_data(crm, target_date=None):
     print(f"Verification Status:     {status}")
     print(f"{'='*60}\n")
 
-    update_data_verified_status(crm.CLIENT_ID, bool(is_verified))
+    if not dry_run:
+        update_data_verified_status(crm.CLIENT_ID, bool(is_verified))
 
     return {
         "status": status,
@@ -375,6 +387,11 @@ def main():
         type=str,
         help="Date to verify in MM/DD/YYYY format (default: yesterday)",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run verification without updating the database",
+    )
     args = parser.parse_args()
 
     target_date = None
@@ -393,7 +410,7 @@ def main():
 
     results = []
     for crm in crm_list:
-        result = verify_data(crm, target_date)
+        result = verify_data(crm, target_date, dry_run=args.dry_run)
         results.append(result)
 
     # Summary
