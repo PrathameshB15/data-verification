@@ -1,8 +1,9 @@
 """
 Data Verification Script
-Compares the number of orders from CRM API with the database for yesterday.
-If the database count is at least 90% of the CRM count, verification passes.
-Test orders are excluded from the comparison.
+Verifies order data through a 3-step pipeline:
+1. Fetch order count from CRM API
+2. Fetch deduplicated order count from Azure Blob (parquet files)
+3. Compare: API count == Blob count, then (Blob count - test orders) == DB count
 """
 
 import argparse
@@ -10,12 +11,14 @@ import configparser
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
+import pandas as pd
 import psycopg2
 import requests
+from azure.storage.blob import ContainerClient
 
 
 # Configuration
-config = configparser.ConfigParser()
+config = configparser.RawConfigParser()
 config.read("config.ini")
 
 PSG_USER = config.get("database", "PSG_USER")
@@ -24,7 +27,10 @@ PSG_HOST = config.get("database", "PSG_HOST")
 PSG_PORT = int(config.get("database", "PSG_PORT"))
 PSG_DATABASE = config.get("database", "PSG_DATABASE")
 
-VERIFICATION_THRESHOLD = 0.90  # 90% threshold
+BLOB_CONTAINER_URL = config.get("azure", "BLOB_CONTAINER_URL")
+
+API_BLOB_THRESHOLD = 0.99  # 99% match between API and Blob
+BLOB_DB_THRESHOLD = 0.99   # 99% match between Blob (non-test) and DB
 
 
 def get_crm_credentials(crm_name, client_id):
@@ -71,11 +77,9 @@ def get_crm_credentials(crm_name, client_id):
 def get_crm_order_count(crm, date_str):
     """
     Fetch the count of orders from CRM API for a specific date.
-    Excludes test orders by using criteria 'all' and then counting non-test orders.
     """
     order_find_url = f"https://{crm.CRM_HOST}/api/v1/order_find"
 
-    # Fetch orders for the full day
     order_find_payload = {
         "campaign_id": "all",
         "start_date": date_str,
@@ -108,6 +112,61 @@ def get_crm_order_count(crm, date_str):
         return None, []
 
 
+def get_blob_order_data(client_id, target_date):
+    """
+    Fetch and deduplicate order data from Azure Blob parquet files.
+    Path: processed/sticky/{client_id}/{year}/{month}/{day}/*.parquet
+    Deduplication key: (transaction_id, date_of_sale, order_id, product_id, client_id)
+    Returns: (total_deduplicated_count, non_test_count, test_count, DataFrame)
+    """
+    year = target_date.strftime("%Y")
+    month = target_date.strftime("%m")
+    day = target_date.strftime("%d")
+    prefix = f"sticky/{client_id}/{year}/{month}/{day}/"
+
+    try:
+        container_client = ContainerClient.from_container_url(BLOB_CONTAINER_URL)
+
+        # List all parquet files for the day
+        blobs = list(container_client.list_blobs(name_starts_with=prefix))
+        if not blobs:
+            print(f"No blob files found at: {prefix}")
+            return None, None, None, None
+
+        print(f"Found {len(blobs)} parquet file(s) at: {prefix}")
+
+        # Read and concatenate all parquet files
+        dfs = []
+        for blob in blobs:
+            blob_client = container_client.get_blob_client(blob.name)
+            data = blob_client.download_blob().readall()
+            df = pd.read_parquet(pd.io.common.BytesIO(data))
+            dfs.append(df)
+
+        combined = pd.concat(dfs, ignore_index=True)
+        print(f"Total rows across all files: {len(combined)}")
+
+        # Deduplicate based on unique key
+        dedup_cols = ["TRANSACTION_ID", "DATE_OF_SALE", "ORDER_ID", "PRODUCT_ID", "CLIENT_ID"]
+        deduped = combined.drop_duplicates(subset=dedup_cols)
+        total_count = len(deduped)
+        print(f"Deduplicated rows: {total_count}")
+
+        # Identify test orders: IS_TEST == "True" or BILL_EMAIL contains 'test'
+        test_mask = deduped["IS_TEST"].astype(str).str.lower().eq("true") | deduped["BILL_EMAIL"].str.contains("test", case=False, na=False)
+        test_count = test_mask.sum()
+        non_test_count = total_count - test_count
+
+        print(f"Test orders: {test_count}")
+        print(f"Non-test orders: {non_test_count}")
+
+        return total_count, non_test_count, test_count, deduped
+
+    except Exception as e:
+        print(f"Error fetching blob data: {e}")
+        return None, None, None, None
+
+
 def get_db_order_count(client_id, date_str):
     """
     Fetch the count of orders from the database for a specific date.
@@ -127,7 +186,6 @@ def get_db_order_count(client_id, date_str):
         date_obj = datetime.strptime(date_str, "%m/%d/%Y")
         sql_date = date_obj.strftime("%Y-%m-%d")
 
-        # Count orders from data.orders_{client_id} table
         table_name = f"data.orders_{client_id}"
         sql = f"""
             SELECT COUNT(1)
@@ -152,7 +210,6 @@ def get_db_order_count(client_id, date_str):
 def update_data_verified_status(client_id, is_verified):
     """
     Update the data_verified column in beast_insights_v2.clients_pipeline_status table.
-    Sets to True if match > 90%, else False.
     """
     try:
         conn = psycopg2.connect(
@@ -190,10 +247,10 @@ def update_data_verified_status(client_id, is_verified):
 
 def verify_data(crm, target_date=None):
     """
-    Verify the data by comparing CRM order count with database order count.
-    Returns verification result with details.
+    Verify data through 3-step pipeline:
+    Step 1: API count vs Blob count (deduplicated)
+    Step 2: Blob count (minus test orders) vs DB count
     """
-    # Use yesterday's date if no date provided
     if target_date is None:
         target_date = datetime.now() - timedelta(days=1)
 
@@ -204,50 +261,90 @@ def verify_data(crm, target_date=None):
     print(f"Date: {date_str}")
     print(f"{'='*60}")
 
-    # Get CRM order count
+    # Step 1: Get CRM API order count
+    print(f"\n--- Step 1: CRM API Order Count ---")
     crm_count, _ = get_crm_order_count(crm, date_str)
     if crm_count is None:
         print("FAILED: Could not fetch CRM order count")
+        update_data_verified_status(crm.CLIENT_ID, False)
+        return {"status": "ERROR", "client_id": crm.CLIENT_ID, "client_name": crm.CLIENT_NAME, "date": date_str, "error": "Failed to fetch CRM order count"}
+
+    print(f"CRM API Order Count: {crm_count}")
+
+    # Step 2: Get Blob order count (deduplicated)
+    print(f"\n--- Step 2: Azure Blob Order Count ---")
+    blob_total, blob_non_test, blob_test, _ = get_blob_order_data(crm.CLIENT_ID, target_date)
+    if blob_total is None:
+        print("FAILED: Could not fetch blob data")
+        update_data_verified_status(crm.CLIENT_ID, False)
+        return {"status": "ERROR", "client_id": crm.CLIENT_ID, "client_name": crm.CLIENT_NAME, "date": date_str, "error": "Failed to fetch blob data"}
+
+    # Step 3: Compare API count with Blob count (99% threshold)
+    print(f"\n--- Step 3: API vs Blob Comparison ---")
+    print(f"CRM API Count:           {crm_count}")
+    print(f"Blob Total (deduped):    {blob_total}")
+
+    if crm_count > 0:
+        api_blob_pct = min(crm_count, blob_total) / max(crm_count, blob_total) * 100
+    else:
+        api_blob_pct = 100.0 if blob_total == 0 else 0.0
+
+    api_blob_pass = api_blob_pct >= (API_BLOB_THRESHOLD * 100)
+    print(f"Match Percentage:        {api_blob_pct:.2f}%")
+    print(f"Threshold:               {API_BLOB_THRESHOLD * 100}%")
+    print(f"Status:                  {'PASS' if api_blob_pass else 'FAIL'}")
+
+    if not api_blob_pass:
+        diff = abs(crm_count - blob_total)
+        print(f"Difference:              {diff}")
+        print("FAILED: API vs Blob match below threshold")
+        update_data_verified_status(crm.CLIENT_ID, False)
         return {
-            "status": "ERROR",
+            "status": "FAIL",
             "client_id": crm.CLIENT_ID,
             "client_name": crm.CLIENT_NAME,
             "date": date_str,
-            "error": "Failed to fetch CRM order count",
+            "crm_count": crm_count,
+            "blob_total": blob_total,
+            "api_blob_pct": api_blob_pct,
+            "step_failed": "API vs Blob",
+            "is_verified": False,
         }
 
-    # Get database order count (excluding test orders)
+    # Step 4: Compare Blob non-test count with DB count
+    print(f"\n--- Step 4: Blob (non-test) vs DB Comparison ---")
     db_count = get_db_order_count(crm.CLIENT_ID, date_str)
     if db_count is None:
         print("FAILED: Could not fetch database order count")
-        return {
-            "status": "ERROR",
-            "client_id": crm.CLIENT_ID,
-            "client_name": crm.CLIENT_NAME,
-            "date": date_str,
-            "error": "Failed to fetch database order count",
-        }
+        update_data_verified_status(crm.CLIENT_ID, False)
+        return {"status": "ERROR", "client_id": crm.CLIENT_ID, "client_name": crm.CLIENT_NAME, "date": date_str, "error": "Failed to fetch database order count"}
 
-    # Calculate match percentage
-    if crm_count > 0:
-        match_percentage = (db_count / crm_count) * 100
+    print(f"Blob Non-Test Count:     {blob_non_test}")
+    print(f"Blob Test Orders:        {blob_test}")
+    print(f"DB Order Count:          {db_count}")
+
+    if blob_non_test > 0:
+        blob_db_pct = min(blob_non_test, db_count) / max(blob_non_test, db_count) * 100
     else:
-        match_percentage = 100.0 if db_count == 0 else 0.0
+        blob_db_pct = 100.0 if db_count == 0 else 0.0
 
-    # Determine verification status
-    is_verified = match_percentage >= (VERIFICATION_THRESHOLD * 100)
+    blob_db_pass = blob_db_pct >= (BLOB_DB_THRESHOLD * 100)
+    print(f"Match Percentage:        {blob_db_pct:.2f}%")
+    print(f"Threshold:               {BLOB_DB_THRESHOLD * 100}%")
+    print(f"Status:                  {'PASS' if blob_db_pass else 'FAIL'}")
+
+    if not blob_db_pass:
+        diff = abs(blob_non_test - db_count)
+        print(f"Difference:              {diff}")
+
+    is_verified = blob_db_pass
     status = "PASS" if is_verified else "FAIL"
 
-    # Print results
-    print(f"\nCRM Order Count (Total):     {crm_count}")
-    print(f"DB Order Count (Active):     {db_count}")
-    print(f"Match Percentage:            {match_percentage:.2f}%")
-    print(f"Threshold:                   {VERIFICATION_THRESHOLD * 100}%")
-    print(f"\nVerification Status:         {status}")
+    print(f"\n{'='*60}")
+    print(f"Verification Status:     {status}")
     print(f"{'='*60}\n")
 
-    # Update data_verified status in clients_pipeline_status table
-    update_data_verified_status(crm.CLIENT_ID, is_verified)
+    update_data_verified_status(crm.CLIENT_ID, bool(is_verified))
 
     return {
         "status": status,
@@ -255,16 +352,17 @@ def verify_data(crm, target_date=None):
         "client_name": crm.CLIENT_NAME,
         "date": date_str,
         "crm_count": crm_count,
+        "blob_total": blob_total,
+        "blob_non_test": blob_non_test,
+        "blob_test": blob_test,
         "db_count": db_count,
-        "match_percentage": match_percentage,
-        "threshold": VERIFICATION_THRESHOLD * 100,
         "is_verified": is_verified,
     }
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Verify order data between CRM and database."
+        description="Verify order data between CRM API, Azure Blob, and database."
     )
     parser.add_argument(
         "--client_id", type=str, required=True, help="Client ID for verification"
@@ -279,7 +377,6 @@ def main():
     )
     args = parser.parse_args()
 
-    # Parse custom date if provided
     target_date = None
     if args.date:
         try:
@@ -288,14 +385,12 @@ def main():
             print(f"Invalid date format: {args.date}. Please use MM/DD/YYYY format.")
             return
 
-    # Get CRM credentials
     crm_list = get_crm_credentials(args.crm, args.client_id)
 
     if not crm_list:
         print(f"No CRM credentials found for client_id: {args.client_id}")
         return
 
-    # Run verification for each CRM
     results = []
     for crm in crm_list:
         result = verify_data(crm, target_date)
@@ -315,7 +410,6 @@ def main():
     print(f"Failed: {failed}")
     print(f"Errors: {errors}")
 
-    # Exit with error code if any verification failed
     if failed > 0 or errors > 0:
         exit(1)
 
