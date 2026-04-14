@@ -151,6 +151,9 @@ def get_blob_order_data(client_id, target_date):
         combined = combined[combined["DATE_OF_SALE"].astype(str) == target_date_str]
         print(f"Rows for {target_date_str}: {len(combined)}")
 
+        # Normalize TRANSACTION_ID: NaN and empty string are treated as the same
+        combined["TRANSACTION_ID"] = combined["TRANSACTION_ID"].fillna("")
+
         # Deduplicate based on unique key
         dedup_cols = ["TRANSACTION_ID", "DATE_OF_SALE", "ORDER_ID", "PRODUCT_ID", "CLIENT_ID"]
         deduped = combined.drop_duplicates(subset=dedup_cols)
