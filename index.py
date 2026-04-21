@@ -430,6 +430,11 @@ def main():
         action="store_true",
         help="Run verification without updating the database",
     )
+    parser.add_argument(
+        "--export",
+        action="store_true",
+        help="Export results to an xlsx report (default: no file written)",
+    )
     args = parser.parse_args()
 
     # Build list of dates to verify
@@ -471,7 +476,7 @@ def main():
 
     print(f"Verifying {len(crm_list)} client(s) for {len(dates_to_verify)} date(s)...\n")
 
-    filename = f"sticky_verification_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    filename = f"sticky_verification_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx" if args.export else None
     all_results = []
 
     for crm in crm_list:
@@ -500,29 +505,30 @@ def main():
         errors = sum(1 for r in client_results if r.get("status") == "ERROR")
         print(f"\n--- {crm.CLIENT_NAME}: Passed={passed} | Failed={failed} | Errors={errors} ---")
 
-        # Update Excel after each client
-        excel_data = []
-        for r in all_results:
-            crm_count = r.get("crm_count")
-            blob_total = r.get("blob_total")
-            blob_non_test = r.get("blob_non_test")
-            db_count = r.get("db_count")
-            excel_data.append({
-                "Client ID": r.get("client_id"),
-                "Client Name": r.get("client_name"),
-                "Date": r.get("date"),
-                "API Count": crm_count,
-                "Blob Count": blob_total,
-                "Test Orders": r.get("blob_test"),
-                "Non-Test Orders": blob_non_test,
-                "DB Count": db_count,
-                "API→Blob %": round((blob_total / crm_count) * 100, 2) if isinstance(crm_count, int) and isinstance(blob_total, int) and crm_count > 0 else None,
-                "Blob→DB %": round(min(blob_non_test, db_count) / max(blob_non_test, db_count) * 100, 2) if isinstance(blob_non_test, int) and isinstance(db_count, int) and max(blob_non_test, db_count) > 0 else None,
-                "Status": r.get("status"),
-            })
-        df = pd.DataFrame(excel_data)
-        df.to_excel(filename, index=False)
-        print(f"Excel updated: {filename} ({len(all_results)} rows)")
+        # Update Excel after each client (only if --export)
+        if args.export:
+            excel_data = []
+            for r in all_results:
+                crm_count = r.get("crm_count")
+                blob_total = r.get("blob_total")
+                blob_non_test = r.get("blob_non_test")
+                db_count = r.get("db_count")
+                excel_data.append({
+                    "Client ID": r.get("client_id"),
+                    "Client Name": r.get("client_name"),
+                    "Date": r.get("date"),
+                    "API Count": crm_count,
+                    "Blob Count": blob_total,
+                    "Test Orders": r.get("blob_test"),
+                    "Non-Test Orders": blob_non_test,
+                    "DB Count": db_count,
+                    "API→Blob %": round((blob_total / crm_count) * 100, 2) if isinstance(crm_count, int) and isinstance(blob_total, int) and crm_count > 0 else None,
+                    "Blob→DB %": round(min(blob_non_test, db_count) / max(blob_non_test, db_count) * 100, 2) if isinstance(blob_non_test, int) and isinstance(db_count, int) and max(blob_non_test, db_count) > 0 else None,
+                    "Status": r.get("status"),
+                })
+            df = pd.DataFrame(excel_data)
+            df.to_excel(filename, index=False)
+            print(f"Excel updated: {filename} ({len(all_results)} rows)")
 
     # Final Summary
     print("\n" + "=" * 110)
@@ -561,7 +567,8 @@ def main():
         print(f"{str(client_id):<10} {client_name:<22} {date:<14} {str(crm_count):>8} {str(blob_total):>8} {str(blob_test):>6} {str(blob_non_test):>10} {str(db_count):>8} {api_blob_pct:>10} {blob_db_pct:>10} {status:<6}")
 
     print("=" * 110)
-    print(f"\nExcel report: {filename}")
+    if args.export:
+        print(f"\nExcel report: {filename}")
 
     if failed > 0 or errors > 0:
         exit(1)

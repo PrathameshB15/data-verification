@@ -422,6 +422,11 @@ def main():
         type=str,
         help="End date for range verification in MM/DD/YYYY format",
     )
+    parser.add_argument(
+        "--export",
+        action="store_true",
+        help="Export results to an xlsx report (default: no file written)",
+    )
     args = parser.parse_args()
 
     # Build list of dates to verify
@@ -496,22 +501,23 @@ def main():
         print(f"{str(client_id):<10} {client_name:<22} {date:<14} {str(crm_count):>8} {str(db_count):>8} {match_str:>10} {status:<6}")
     print("=" * 90)
 
-    # Export to Excel
-    excel_data = []
-    for r in results:
-        excel_data.append({
-            "Client ID": r.get("client_id"),
-            "Client Name": r.get("client_name"),
-            "Date": r.get("date"),
-            "CRM Count": r.get("crm_count"),
-            "DB Count": r.get("db_count"),
-            "Match %": r.get("match_percentage"),
-            "Status": r.get("status"),
-        })
-    df = pd.DataFrame(excel_data)
-    filename = f"konnektive_verification_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-    df.to_excel(filename, index=False)
-    print(f"\nExcel report saved: {filename}")
+    # Export to Excel (only if --export)
+    if args.export:
+        excel_data = []
+        for r in results:
+            excel_data.append({
+                "Client ID": r.get("client_id"),
+                "Client Name": r.get("client_name"),
+                "Date": r.get("date"),
+                "CRM Count": r.get("crm_count"),
+                "DB Count": r.get("db_count"),
+                "Match %": r.get("match_percentage"),
+                "Status": r.get("status"),
+            })
+        df = pd.DataFrame(excel_data)
+        filename = f"konnektive_verification_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        df.to_excel(filename, index=False)
+        print(f"\nExcel report saved: {filename}")
 
     if failed > 0 or errors > 0:
         exit(1)
