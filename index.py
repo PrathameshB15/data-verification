@@ -8,6 +8,7 @@ Verifies order data through a 3-step pipeline:
 
 import argparse
 import configparser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
@@ -33,8 +34,8 @@ API_BLOB_THRESHOLD = 0.99  # 99% match between API and Blob
 BLOB_DB_THRESHOLD = 0.99   # 99% match between Blob (non-test) and DB
 
 
-def get_crm_credentials(crm_name, client_id):
-    """Fetch CRM credentials from the database."""
+def get_crm_credentials(crm_name, client_id=None):
+    """Fetch CRM credentials from the database. If client_id is None, fetch all active clients."""
     try:
         conn = psycopg2.connect(
             user=PSG_USER,
@@ -45,20 +46,38 @@ def get_crm_credentials(crm_name, client_id):
         )
         cur = conn.cursor()
 
-        sql = f"""
-            SELECT cc.id       as "CRENDENTIAL_ID",
-                   cl.id       as "CLIENT_ID",
-                   cl.name     as "CLIENT_NAME",
-                   cc.username as "CRM_USERNAME",
-                   cc.password as "CRM_PASSWORD",
-                   cc.host     as "CRM_HOST",
-                   cc.key      as "CRM_API_KEY",
-                   crm.name    AS "CRM_NAME"
-            FROM beast_insights_v2.clients AS cl
-                INNER JOIN beast_insights_v2.crm_credentials cc ON cl.id = cc.client_id
-                INNER JOIN beast_insights_v2.crms crm ON cc.crm_id = crm.id
-            WHERE crm.name = '{crm_name}' AND cl.id = {client_id};
-        """
+        if client_id:
+            sql = f"""
+                SELECT cc.id       as "CRENDENTIAL_ID",
+                       cl.id       as "CLIENT_ID",
+                       cl.name     as "CLIENT_NAME",
+                       cc.username as "CRM_USERNAME",
+                       cc.password as "CRM_PASSWORD",
+                       cc.host     as "CRM_HOST",
+                       cc.key      as "CRM_API_KEY",
+                       crm.name    AS "CRM_NAME"
+                FROM beast_insights_v2.clients AS cl
+                    INNER JOIN beast_insights_v2.crm_credentials cc ON cl.id = cc.client_id
+                    INNER JOIN beast_insights_v2.crms crm ON cc.crm_id = crm.id
+                WHERE crm.name = '{crm_name}' AND cl.id = {client_id};
+            """
+        else:
+            sql = f"""
+                SELECT cc.id       as "CRENDENTIAL_ID",
+                       cl.id       as "CLIENT_ID",
+                       cl.name     as "CLIENT_NAME",
+                       cc.username as "CRM_USERNAME",
+                       cc.password as "CRM_PASSWORD",
+                       cc.host     as "CRM_HOST",
+                       cc.key      as "CRM_API_KEY",
+                       crm.name    AS "CRM_NAME"
+                FROM beast_insights_v2.clients AS cl
+                    INNER JOIN beast_insights_v2.crm_credentials cc ON cl.id = cc.client_id
+                    INNER JOIN beast_insights_v2.crms crm ON cc.crm_id = crm.id
+                WHERE crm.name = '{crm_name}'
+                  AND cl.is_active = true AND cl.is_deleted = false
+                ORDER BY cl.id;
+            """
         cur.execute(sql)
         table_data = cur.fetchall()
         columns = [desc[0] for desc in cur.description]
@@ -211,8 +230,14 @@ def get_db_order_count(client_id, date_str):
         print(f"Error fetching order count from database: {e}")
         return None
     finally:
-        cur.close()
-        conn.close()
+        try:
+            cur.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def update_data_verified_status(client_id, is_verified):
@@ -380,7 +405,7 @@ def main():
         description="Verify order data between CRM API, Azure Blob, and database."
     )
     parser.add_argument(
-        "--client_id", type=str, required=True, help="Client ID for verification"
+        "--client_id", type=str, help="Client ID for verification (default: all active clients)"
     )
     parser.add_argument(
         "--crm", type=str, default="Sticky", help="CRM name (default: Sticky)"
@@ -391,44 +416,152 @@ def main():
         help="Date to verify in MM/DD/YYYY format (default: yesterday)",
     )
     parser.add_argument(
+        "--start_date",
+        type=str,
+        help="Start date for range verification in MM/DD/YYYY format",
+    )
+    parser.add_argument(
+        "--end_date",
+        type=str,
+        help="End date for range verification in MM/DD/YYYY format",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Run verification without updating the database",
     )
     args = parser.parse_args()
 
-    target_date = None
-    if args.date:
+    # Build list of dates to verify
+    dates_to_verify = []
+    if args.start_date and args.end_date:
         try:
-            target_date = datetime.strptime(args.date, "%m/%d/%Y")
+            start = datetime.strptime(args.start_date, "%m/%d/%Y")
+            end = datetime.strptime(args.end_date, "%m/%d/%Y")
+        except ValueError:
+            print("Invalid date format. Please use MM/DD/YYYY format.")
+            return
+        current = start
+        while current <= end:
+            dates_to_verify.append(current)
+            current += timedelta(days=1)
+    elif args.date:
+        try:
+            dates_to_verify.append(datetime.strptime(args.date, "%m/%d/%Y"))
         except ValueError:
             print(f"Invalid date format: {args.date}. Please use MM/DD/YYYY format.")
             return
+    else:
+        dates_to_verify.append(datetime.now() - timedelta(days=1))
 
     crm_list = get_crm_credentials(args.crm, args.client_id)
 
     if not crm_list:
-        print(f"No CRM credentials found for client_id: {args.client_id}")
+        print(f"No CRM credentials found" + (f" for client_id: {args.client_id}" if args.client_id else f" for CRM: {args.crm}"))
         return
 
-    results = []
+    # Deduplicate by CLIENT_ID (in case multiple credentials per client)
+    seen_clients = set()
+    unique_crm_list = []
     for crm in crm_list:
-        result = verify_data(crm, target_date, dry_run=args.dry_run)
-        results.append(result)
+        if crm.CLIENT_ID not in seen_clients:
+            seen_clients.add(crm.CLIENT_ID)
+            unique_crm_list.append(crm)
+    crm_list = unique_crm_list
 
-    # Summary
-    print("\n" + "=" * 60)
-    print("VERIFICATION SUMMARY")
-    print("=" * 60)
+    print(f"Verifying {len(crm_list)} client(s) for {len(dates_to_verify)} date(s)...\n")
 
-    passed = sum(1 for r in results if r.get("status") == "PASS")
-    failed = sum(1 for r in results if r.get("status") == "FAIL")
-    errors = sum(1 for r in results if r.get("status") == "ERROR")
+    filename = f"sticky_verification_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    all_results = []
 
-    print(f"Total Verified: {len(results)}")
-    print(f"Passed: {passed}")
-    print(f"Failed: {failed}")
-    print(f"Errors: {errors}")
+    for crm in crm_list:
+        print(f"\n{'#'*60}")
+        print(f"# Client: {crm.CLIENT_NAME} (ID: {crm.CLIENT_ID})")
+        print(f"{'#'*60}")
+
+        # Run all dates for this client in parallel
+        client_results = []
+        if len(dates_to_verify) > 1:
+            max_workers = min(len(dates_to_verify), 3)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(verify_data, crm, d, dry_run=args.dry_run): d for d in dates_to_verify}
+                for future in as_completed(futures):
+                    client_results.append(future.result())
+            client_results.sort(key=lambda r: r.get("date", ""))
+        else:
+            for d in dates_to_verify:
+                client_results.append(verify_data(crm, d, dry_run=args.dry_run))
+
+        all_results.extend(client_results)
+
+        # Print client summary
+        passed = sum(1 for r in client_results if r.get("status") == "PASS")
+        failed = sum(1 for r in client_results if r.get("status") == "FAIL")
+        errors = sum(1 for r in client_results if r.get("status") == "ERROR")
+        print(f"\n--- {crm.CLIENT_NAME}: Passed={passed} | Failed={failed} | Errors={errors} ---")
+
+        # Update Excel after each client
+        excel_data = []
+        for r in all_results:
+            crm_count = r.get("crm_count")
+            blob_total = r.get("blob_total")
+            blob_non_test = r.get("blob_non_test")
+            db_count = r.get("db_count")
+            excel_data.append({
+                "Client ID": r.get("client_id"),
+                "Client Name": r.get("client_name"),
+                "Date": r.get("date"),
+                "API Count": crm_count,
+                "Blob Count": blob_total,
+                "Test Orders": r.get("blob_test"),
+                "Non-Test Orders": blob_non_test,
+                "DB Count": db_count,
+                "API→Blob %": round((blob_total / crm_count) * 100, 2) if isinstance(crm_count, int) and isinstance(blob_total, int) and crm_count > 0 else None,
+                "Blob→DB %": round(min(blob_non_test, db_count) / max(blob_non_test, db_count) * 100, 2) if isinstance(blob_non_test, int) and isinstance(db_count, int) and max(blob_non_test, db_count) > 0 else None,
+                "Status": r.get("status"),
+            })
+        df = pd.DataFrame(excel_data)
+        df.to_excel(filename, index=False)
+        print(f"Excel updated: {filename} ({len(all_results)} rows)")
+
+    # Final Summary
+    print("\n" + "=" * 110)
+    print("FINAL VERIFICATION SUMMARY")
+    print("=" * 110)
+
+    passed = sum(1 for r in all_results if r.get("status") == "PASS")
+    failed = sum(1 for r in all_results if r.get("status") == "FAIL")
+    errors = sum(1 for r in all_results if r.get("status") == "ERROR")
+
+    print(f"Clients: {len(crm_list)} | Days: {len(dates_to_verify)} | Total: {len(all_results)} | Passed: {passed} | Failed: {failed} | Errors: {errors}")
+
+    print(f"\n{'Client':<10} {'Name':<22} {'Date':<14} {'API':>8} {'Blob':>8} {'Test':>6} {'Non-Test':>10} {'DB':>8} {'API→Blob':>10} {'Blob→DB':>10} {'Status':<6}")
+    print("-" * 110)
+    for r in all_results:
+        client_id = r.get("client_id", "-")
+        client_name = str(r.get("client_name", "-"))[:20]
+        date = r.get("date", "N/A")
+        status = r.get("status", "N/A")
+        crm_count = r.get("crm_count", "-")
+        blob_total = r.get("blob_total", "-")
+        blob_test = r.get("blob_test", "-")
+        blob_non_test = r.get("blob_non_test", "-")
+        db_count = r.get("db_count", "-")
+
+        if isinstance(crm_count, int) and isinstance(blob_total, int) and crm_count > 0:
+            api_blob_pct = f"{(blob_total / crm_count) * 100:.1f}%"
+        else:
+            api_blob_pct = "-"
+
+        if isinstance(blob_non_test, int) and isinstance(db_count, int) and max(blob_non_test, db_count) > 0:
+            blob_db_pct = f"{min(blob_non_test, db_count) / max(blob_non_test, db_count) * 100:.1f}%"
+        else:
+            blob_db_pct = "-"
+
+        print(f"{str(client_id):<10} {client_name:<22} {date:<14} {str(crm_count):>8} {str(blob_total):>8} {str(blob_test):>6} {str(blob_non_test):>10} {str(db_count):>8} {api_blob_pct:>10} {blob_db_pct:>10} {status:<6}")
+
+    print("=" * 110)
+    print(f"\nExcel report: {filename}")
 
     if failed > 0 or errors > 0:
         exit(1)

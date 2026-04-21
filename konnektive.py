@@ -6,9 +6,11 @@ If the database count is at least 90% of the CRM count, verification passes.
 
 import argparse
 import configparser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
+import pandas as pd
 import psycopg2
 import pytz
 import requests
@@ -80,8 +82,8 @@ def get_client_timezone(client_id):
         conn.close()
 
 
-def get_crm_credentials(crm_name, client_id):
-    """Fetch CRM credentials from the database."""
+def get_crm_credentials(crm_name, client_id=None):
+    """Fetch CRM credentials from the database. If client_id is None, fetch all active clients."""
     try:
         conn = psycopg2.connect(
             user=PSG_USER,
@@ -92,20 +94,38 @@ def get_crm_credentials(crm_name, client_id):
         )
         cur = conn.cursor()
 
-        sql = f"""
-            SELECT cc.id       as "CRENDENTIAL_ID",
-                   cl.id       as "CLIENT_ID",
-                   cl.name     as "CLIENT_NAME",
-                   cc.username as "CRM_USERNAME",
-                   cc.password as "CRM_PASSWORD",
-                   cc.host     as "CRM_HOST",
-                   cc.key      as "CRM_API_KEY",
-                   crm.name    AS "CRM_NAME"
-            FROM beast_insights_v2.clients AS cl
-                INNER JOIN beast_insights_v2.crm_credentials cc ON cl.id = cc.client_id
-                INNER JOIN beast_insights_v2.crms crm ON cc.crm_id = crm.id
-            WHERE crm.name = '{crm_name}' AND cl.id = {client_id};
-        """
+        if client_id:
+            sql = f"""
+                SELECT cc.id       as "CRENDENTIAL_ID",
+                       cl.id       as "CLIENT_ID",
+                       cl.name     as "CLIENT_NAME",
+                       cc.username as "CRM_USERNAME",
+                       cc.password as "CRM_PASSWORD",
+                       cc.host     as "CRM_HOST",
+                       cc.key      as "CRM_API_KEY",
+                       crm.name    AS "CRM_NAME"
+                FROM beast_insights_v2.clients AS cl
+                    INNER JOIN beast_insights_v2.crm_credentials cc ON cl.id = cc.client_id
+                    INNER JOIN beast_insights_v2.crms crm ON cc.crm_id = crm.id
+                WHERE crm.name = '{crm_name}' AND cl.id = {client_id};
+            """
+        else:
+            sql = f"""
+                SELECT cc.id       as "CRENDENTIAL_ID",
+                       cl.id       as "CLIENT_ID",
+                       cl.name     as "CLIENT_NAME",
+                       cc.username as "CRM_USERNAME",
+                       cc.password as "CRM_PASSWORD",
+                       cc.host     as "CRM_HOST",
+                       cc.key      as "CRM_API_KEY",
+                       crm.name    AS "CRM_NAME"
+                FROM beast_insights_v2.clients AS cl
+                    INNER JOIN beast_insights_v2.crm_credentials cc ON cl.id = cc.client_id
+                    INNER JOIN beast_insights_v2.crms crm ON cc.crm_id = crm.id
+                WHERE crm.name = '{crm_name}'
+                  AND cl.is_active = true AND cl.is_deleted = false
+                ORDER BY cl.id;
+            """
         cur.execute(sql)
         table_data = cur.fetchall()
         columns = [desc[0] for desc in cur.description]
@@ -384,7 +404,7 @@ def main():
         description="Verify order data between Konnektive CRM and database."
     )
     parser.add_argument(
-        "--client_id", type=str, default="10057", help="Client ID for verification (default: 10057)"
+        "--client_id", type=str, help="Client ID for verification (default: all active Konnektive clients)"
     )
     
     parser.add_argument(
@@ -392,45 +412,107 @@ def main():
         type=str,
         help="Date to verify in MM/DD/YYYY format (default: yesterday)",
     )
+    parser.add_argument(
+        "--start_date",
+        type=str,
+        help="Start date for range verification in MM/DD/YYYY format",
+    )
+    parser.add_argument(
+        "--end_date",
+        type=str,
+        help="End date for range verification in MM/DD/YYYY format",
+    )
     args = parser.parse_args()
 
-    # Parse custom date if provided
-    target_date = None
-    if args.date:
+    # Build list of dates to verify
+    dates_to_verify = []
+    if args.start_date and args.end_date:
         try:
-            target_date = datetime.strptime(args.date, "%m/%d/%Y")
+            start = datetime.strptime(args.start_date, "%m/%d/%Y")
+            end = datetime.strptime(args.end_date, "%m/%d/%Y")
+        except ValueError:
+            print("Invalid date format. Please use MM/DD/YYYY format.")
+            return
+        current = start
+        while current <= end:
+            dates_to_verify.append(current)
+            current += timedelta(days=1)
+    elif args.date:
+        try:
+            dates_to_verify.append(datetime.strptime(args.date, "%m/%d/%Y"))
         except ValueError:
             print(f"Invalid date format: {args.date}. Please use MM/DD/YYYY format.")
             return
+    else:
+        dates_to_verify.append(None)  # Will use yesterday in client's timezone
 
     # Get CRM credentials for Konnektive
     crm_list = get_crm_credentials("Konnektive", args.client_id)
 
     if not crm_list:
-        print(f"No Konnektive CRM credentials found for client_id: {args.client_id}")
+        print(f"No Konnektive CRM credentials found" + (f" for client_id: {args.client_id}" if args.client_id else ""))
         return
 
-    # Run verification for each CRM
+    print(f"Verifying {len(crm_list)} client(s) for {len(dates_to_verify)} date(s)...\n")
+
+    # Build all (crm, date) tasks
+    tasks = [(crm, d) for d in dates_to_verify for crm in crm_list]
+
     results = []
-    for crm in crm_list:
-        result = verify_data(crm, target_date)
-        results.append(result)
+    if len(tasks) > 1:
+        max_workers = min(len(tasks), 5)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(verify_data, crm, d): (crm, d) for crm, d in tasks}
+            for future in as_completed(futures):
+                results.append(future.result())
+        results.sort(key=lambda r: (str(r.get("client_id", "")), r.get("date", "")))
+    else:
+        for crm, d in tasks:
+            results.append(verify_data(crm, d))
 
     # Summary
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 90)
     print("VERIFICATION SUMMARY")
-    print("=" * 60)
+    print("=" * 90)
 
     passed = sum(1 for r in results if r.get("status") == "PASS")
     failed = sum(1 for r in results if r.get("status") == "FAIL")
     errors = sum(1 for r in results if r.get("status") == "ERROR")
 
-    print(f"Total Verified: {len(results)}")
-    print(f"Passed: {passed}")
-    print(f"Failed: {failed}")
-    print(f"Errors: {errors}")
+    print(f"Clients: {len(crm_list)} | Days: {len(dates_to_verify)} | Passed: {passed} | Failed: {failed} | Errors: {errors}")
 
-    # Exit with error code if any verification failed
+    # Date-wise breakdown
+    print(f"\n{'Client':<10} {'Name':<22} {'Date':<14} {'CRM':>8} {'DB':>8} {'Match%':>10} {'Status':<6}")
+    print("-" * 90)
+    for r in results:
+        client_id = r.get("client_id", "-")
+        client_name = str(r.get("client_name", "-"))[:20]
+        date = r.get("date", "N/A")
+        status = r.get("status", "N/A")
+        crm_count = r.get("crm_count", "-")
+        db_count = r.get("db_count", "-")
+        match_pct = r.get("match_percentage")
+        match_str = f"{match_pct:.1f}%" if match_pct is not None else "-"
+        print(f"{str(client_id):<10} {client_name:<22} {date:<14} {str(crm_count):>8} {str(db_count):>8} {match_str:>10} {status:<6}")
+    print("=" * 90)
+
+    # Export to Excel
+    excel_data = []
+    for r in results:
+        excel_data.append({
+            "Client ID": r.get("client_id"),
+            "Client Name": r.get("client_name"),
+            "Date": r.get("date"),
+            "CRM Count": r.get("crm_count"),
+            "DB Count": r.get("db_count"),
+            "Match %": r.get("match_percentage"),
+            "Status": r.get("status"),
+        })
+    df = pd.DataFrame(excel_data)
+    filename = f"konnektive_verification_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    df.to_excel(filename, index=False)
+    print(f"\nExcel report saved: {filename}")
+
     if failed > 0 or errors > 0:
         exit(1)
 

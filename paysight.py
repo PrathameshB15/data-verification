@@ -7,9 +7,11 @@ If the database count is at least 90% of the CRM count, verification passes.
 import argparse
 import configparser
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
+import pandas as pd
 import psycopg2
 import requests
 
@@ -30,8 +32,8 @@ MAX_RETRIES = 5
 RETRY_BACKOFF = [5, 15, 30, 60, 120]
 
 
-def get_crm_credentials(client_id):
-    """Fetch Paysight CRM credentials from the database."""
+def get_crm_credentials(client_id=None):
+    """Fetch Paysight CRM credentials from the database. If client_id is None, fetch all active clients."""
     try:
         conn = psycopg2.connect(
             user=PSG_USER,
@@ -42,21 +44,40 @@ def get_crm_credentials(client_id):
         )
         cur = conn.cursor()
 
-        sql = """
-            SELECT cc.id       as "CRENDENTIAL_ID",
-                   cl.id       as "CLIENT_ID",
-                   cl.name     as "CLIENT_NAME",
-                   cc.username as "CRM_USERNAME",
-                   cc.password as "CRM_PASSWORD",
-                   cc.host     as "CRM_HOST",
-                   cc.key      as "CRM_API_KEY",
-                   crm.name    AS "CRM_NAME"
-            FROM beast_insights_v2.clients AS cl
-                INNER JOIN beast_insights_v2.crm_credentials cc ON cl.id = cc.client_id
-                INNER JOIN beast_insights_v2.crms crm ON cc.crm_id = crm.id
-            WHERE crm.name = 'Paysight' AND cl.id = %s;
-        """
-        cur.execute(sql, (client_id,))
+        if client_id:
+            sql = """
+                SELECT cc.id       as "CRENDENTIAL_ID",
+                       cl.id       as "CLIENT_ID",
+                       cl.name     as "CLIENT_NAME",
+                       cc.username as "CRM_USERNAME",
+                       cc.password as "CRM_PASSWORD",
+                       cc.host     as "CRM_HOST",
+                       cc.key      as "CRM_API_KEY",
+                       crm.name    AS "CRM_NAME"
+                FROM beast_insights_v2.clients AS cl
+                    INNER JOIN beast_insights_v2.crm_credentials cc ON cl.id = cc.client_id
+                    INNER JOIN beast_insights_v2.crms crm ON cc.crm_id = crm.id
+                WHERE crm.name = 'Paysight' AND cl.id = %s;
+            """
+            cur.execute(sql, (client_id,))
+        else:
+            sql = """
+                SELECT cc.id       as "CRENDENTIAL_ID",
+                       cl.id       as "CLIENT_ID",
+                       cl.name     as "CLIENT_NAME",
+                       cc.username as "CRM_USERNAME",
+                       cc.password as "CRM_PASSWORD",
+                       cc.host     as "CRM_HOST",
+                       cc.key      as "CRM_API_KEY",
+                       crm.name    AS "CRM_NAME"
+                FROM beast_insights_v2.clients AS cl
+                    INNER JOIN beast_insights_v2.crm_credentials cc ON cl.id = cc.client_id
+                    INNER JOIN beast_insights_v2.crms crm ON cc.crm_id = crm.id
+                WHERE crm.name = 'Paysight'
+                  AND cl.is_active = true AND cl.is_deleted = false
+                ORDER BY cl.id;
+            """
+            cur.execute(sql)
         table_data = cur.fetchall()
         columns = [desc[0] for desc in cur.description]
         results = [SimpleNamespace(**dict(zip(columns, row))) for row in table_data]
@@ -437,52 +458,121 @@ def main():
         description="Verify transaction data between Paysight CRM and database."
     )
     parser.add_argument(
-        "--client_id", type=str, required=True, help="Client ID for verification"
+        "--client_id", type=str, help="Client ID for verification (default: all active Paysight clients)"
     )
     parser.add_argument(
         "--date",
         type=str,
         help="Date to verify in MM/DD/YYYY format (default: yesterday)",
     )
+    parser.add_argument(
+        "--start_date",
+        type=str,
+        help="Start date for range verification in MM/DD/YYYY format",
+    )
+    parser.add_argument(
+        "--end_date",
+        type=str,
+        help="End date for range verification in MM/DD/YYYY format",
+    )
     args = parser.parse_args()
 
-    # Parse custom date if provided
-    target_date = None
-    if args.date:
+    # Build list of dates to verify
+    dates_to_verify = []
+    if args.start_date and args.end_date:
         try:
-            target_date = datetime.strptime(args.date, "%m/%d/%Y")
+            start = datetime.strptime(args.start_date, "%m/%d/%Y")
+            end = datetime.strptime(args.end_date, "%m/%d/%Y")
+        except ValueError:
+            print("Invalid date format. Please use MM/DD/YYYY format.")
+            return
+        current = start
+        while current <= end:
+            dates_to_verify.append(current)
+            current += timedelta(days=1)
+    elif args.date:
+        try:
+            dates_to_verify.append(datetime.strptime(args.date, "%m/%d/%Y"))
         except ValueError:
             print(f"Invalid date format: {args.date}. Please use MM/DD/YYYY format.")
             return
+    else:
+        dates_to_verify.append(datetime.now() - timedelta(days=1))
 
     # Get CRM credentials for Paysight
     crm_list = get_crm_credentials(args.client_id)
 
     if not crm_list:
-        print(f"No Paysight CRM credentials found for client_id: {args.client_id}")
+        print(f"No Paysight CRM credentials found" + (f" for client_id: {args.client_id}" if args.client_id else ""))
         return
 
-    # Run verification for each CRM
+    print(f"Verifying {len(crm_list)} client(s) for {len(dates_to_verify)} date(s)...\n")
+
+    # Build all (crm, date) tasks (Paysight uses max 3 workers to avoid rate limits)
+    tasks = [(crm, d) for d in dates_to_verify for crm in crm_list]
+
     results = []
-    for crm in crm_list:
-        result = verify_data(crm, target_date)
-        results.append(result)
+    if len(tasks) > 1:
+        max_workers = min(len(tasks), 3)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(verify_data, crm, d): (crm, d) for crm, d in tasks}
+            for future in as_completed(futures):
+                results.append(future.result())
+        results.sort(key=lambda r: (str(r.get("client_id", "")), r.get("date", "")))
+    else:
+        for crm, d in tasks:
+            results.append(verify_data(crm, d))
 
     # Summary
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 120)
     print("VERIFICATION SUMMARY")
-    print("=" * 60)
+    print("=" * 120)
 
     passed = sum(1 for r in results if r.get("status") == "PASS")
     failed = sum(1 for r in results if r.get("status") == "FAIL")
     errors = sum(1 for r in results if r.get("status") == "ERROR")
 
-    print(f"Total Verified: {len(results)}")
-    print(f"Passed: {passed}")
-    print(f"Failed: {failed}")
-    print(f"Errors: {errors}")
+    print(f"Clients: {len(crm_list)} | Days: {len(dates_to_verify)} | Passed: {passed} | Failed: {failed} | Errors: {errors}")
 
-    # Exit with error code if any verification failed
+    # Date-wise breakdown
+    print(f"\n{'Client':<10} {'Name':<22} {'Date':<14} {'API Total':>10} {'API Orders':>11} {'Paysight DB':>12} {'Orders DB':>10} {'Pay%':>8} {'Ord%':>8} {'Status':<6}")
+    print("-" * 120)
+    for r in results:
+        client_id = r.get("client_id", "-")
+        client_name = str(r.get("client_name", "-"))[:20]
+        date = r.get("date", "N/A")
+        status = r.get("status", "N/A")
+        crm_total = r.get("crm_total", "-")
+        crm_orders = r.get("crm_orders", "-")
+        paysight_count = r.get("paysight_count", "-")
+        orders_count = r.get("orders_count", "-")
+        pay_pct = r.get("paysight_match")
+        ord_pct = r.get("orders_match")
+        pay_str = f"{pay_pct:.1f}%" if pay_pct is not None else "-"
+        ord_str = f"{ord_pct:.1f}%" if ord_pct is not None else "-"
+        print(f"{str(client_id):<10} {client_name:<22} {date:<14} {str(crm_total):>10} {str(crm_orders):>11} {str(paysight_count):>12} {str(orders_count):>10} {pay_str:>8} {ord_str:>8} {status:<6}")
+    print("=" * 120)
+
+    # Export to Excel
+    excel_data = []
+    for r in results:
+        excel_data.append({
+            "Client ID": r.get("client_id"),
+            "Client Name": r.get("client_name"),
+            "Date": r.get("date"),
+            "API Total": r.get("crm_total"),
+            "API Orders": r.get("crm_orders"),
+            "Paysight DB": r.get("paysight_count"),
+            "Orders DB": r.get("orders_count"),
+            "Paysight Match %": r.get("paysight_match"),
+            "Orders Match %": r.get("orders_match"),
+            "Status": r.get("status"),
+        })
+    df = pd.DataFrame(excel_data)
+    filename = f"paysight_verification_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    df.to_excel(filename, index=False)
+    print(f"\nExcel report saved: {filename}")
+
     if failed > 0 or errors > 0:
         exit(1)
 
