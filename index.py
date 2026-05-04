@@ -93,42 +93,160 @@ def get_crm_credentials(crm_name, client_id=None):
         conn.close()
 
 
-def get_crm_order_count(crm, date_str):
-    """
-    Fetch the count of orders from CRM API for a specific date.
-    """
-    order_find_url = f"https://{crm.CRM_HOST}/api/v1/order_find"
+STICKY_API_DAILY_CAP = 50000
 
-    order_find_payload = {
+
+def _sticky_fetch_order_ids(crm, date_str, start_time, end_time):
+    """Single Sticky order_find call for a [start_time, end_time] window on date_str.
+    Returns list of order_ids on success, None on failure."""
+    order_find_url = f"https://{crm.CRM_HOST}/api/v1/order_find"
+    payload = {
         "campaign_id": "all",
         "start_date": date_str,
-        "start_time": "00:00:00",
+        "start_time": start_time,
         "end_date": date_str,
-        "end_time": "23:59:59",
+        "end_time": end_time,
         "date_type": "create",
         "criteria": "all",
     }
-
     try:
         response = requests.post(
             order_find_url,
-            json=order_find_payload,
+            json=payload,
             auth=(crm.CRM_USERNAME, crm.CRM_PASSWORD),
             timeout=60,
         )
-
         if response.status_code == 200:
-            data = response.json()
-            order_ids = data.get("order_id", [])
-            total_count = len(order_ids)
-            return total_count, order_ids
-        else:
-            print(f"CRM API request failed with status code: {response.status_code}")
+            return response.json().get("order_id", []) or []
+        print(f"CRM API request failed with status code: {response.status_code} ({start_time}–{end_time})")
+        return None
+    except requests.RequestException as e:
+        print(f"Error calling CRM API ({start_time}–{end_time}): {e}")
+        return None
+
+
+def _sticky_order_count(crm, date_str):
+    """Sticky: full-day order_find with AM/PM split if 50k cap hit."""
+    order_ids = _sticky_fetch_order_ids(crm, date_str, "00:00:00", "23:59:59")
+    if order_ids is None:
+        return None, []
+
+    if len(order_ids) < STICKY_API_DAILY_CAP:
+        return len(order_ids), order_ids
+
+    print(f"[split] {date_str}: full-day hit {STICKY_API_DAILY_CAP} cap — splitting into AM/PM windows")
+    am = _sticky_fetch_order_ids(crm, date_str, "00:00:00", "11:59:59")
+    pm = _sticky_fetch_order_ids(crm, date_str, "12:00:00", "23:59:59")
+    if am is None or pm is None:
+        return None, []
+
+    if len(am) >= STICKY_API_DAILY_CAP or len(pm) >= STICKY_API_DAILY_CAP:
+        print(
+            f"[split] {date_str}: half-day window also hit cap "
+            f"(AM={len(am)}, PM={len(pm)}) — count may still be undercounted"
+        )
+
+    merged = list({*am, *pm})
+    return len(merged), merged
+
+
+def _konnektive_order_count(crm, date_str):
+    """Konnektive /order/query/: returns message.totalResults on first page (no pagination needed for count)."""
+    url = f"https://{crm.CRM_HOST}/order/query/"
+    params = {
+        "loginId": crm.CRM_USERNAME,
+        "password": crm.CRM_PASSWORD,
+        "page": 1,
+        "resultsPerPage": 200,
+        "startDate": date_str,
+        "endDate": date_str,
+    }
+    try:
+        r = requests.post(url, params=params, timeout=60)
+        if r.status_code != 200:
+            print(f"Konnektive API request failed: {r.status_code}")
+            return None, []
+        body = r.json()
+        msg = body.get("message") or {}
+        if isinstance(msg, dict) and "totalResults" in msg:
+            return int(msg["totalResults"]), []
+        # API returns string "EMPTY" or {result:"ERROR"} when no orders for the date
+        if body.get("result") == "ERROR" or msg == "EMPTY":
+            return 0, []
+        print(f"Konnektive API: unexpected response shape: {body!r}"[:300])
+        return None, []
+    except requests.RequestException as e:
+        print(f"Error calling Konnektive API: {e}")
+        return None, []
+
+
+def _vrio_order_count(crm, date_str):
+    """Vrio GET /orders: response 'total' field gives the count; first page is enough."""
+    url = f"https://{crm.CRM_HOST}/orders" if crm.CRM_HOST else "https://api.vrio.app/orders"
+    headers = {"X-Api-Key": crm.CRM_API_KEY}
+    sql_date = datetime.strptime(date_str, "%m/%d/%Y").strftime("%Y-%m-%d")
+    params = {"offset": 0, "limit": 1, "date_created_from": sql_date, "date_created_to": sql_date}
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=60)
+        if r.status_code != 200:
+            print(f"Vrio API request failed: {r.status_code}")
+            return None, []
+        body = r.json()
+        if "total" in body:
+            return int(body["total"]), []
+        print(f"Vrio API: missing 'total' in response: {body!r}"[:300])
+        return None, []
+    except requests.RequestException as e:
+        print(f"Error calling Vrio API: {e}")
+        return None, []
+
+
+def _paysight_order_count(crm, date_str):
+    """Paysight POST /api/transactions/search: paginate (limit=1000) until moreResults=false."""
+    url = f"{crm.CRM_HOST.rstrip('/')}/api/transactions/search" if "://" in (crm.CRM_HOST or "") else f"https://{crm.CRM_HOST}/api/transactions/search"
+    headers = {
+        "Authorization": crm.CRM_PASSWORD,
+        "ClientId": crm.CRM_API_KEY,
+        "UserEmail": crm.CRM_USERNAME,
+        "Content-Type": "application/json",
+    }
+    sql_date = datetime.strptime(date_str, "%m/%d/%Y").strftime("%Y-%m-%d")
+    page = 1
+    total = 0
+    while True:
+        body = {"pageNumber": page, "limit": 1000, "dateFrom": sql_date, "dateTo": sql_date, "dateCompleted": True}
+        try:
+            r = requests.post(url, json=body, headers=headers, timeout=60)
+        except requests.RequestException as e:
+            print(f"Error calling Paysight API (page {page}): {e}")
+            return None, []
+        if r.status_code != 200:
+            print(f"Paysight API request failed (page {page}): {r.status_code}")
+            return None, []
+        data = r.json()
+        txs = data.get("transactions") or []
+        total += len(txs)
+        if not data.get("moreResults"):
+            return total, []
+        page += 1
+        if page > 100:
+            print(f"Paysight API: aborting after 100 pages on {date_str} — possible runaway")
             return None, []
 
-    except requests.RequestException as e:
-        print(f"Error calling CRM API: {e}")
-        return None, []
+
+def get_crm_order_count(crm, date_str):
+    """Dispatch to per-CRM order-count helper based on crm.CRM_NAME."""
+    name = (getattr(crm, "CRM_NAME", "") or "").strip().lower()
+    if name == "sticky":
+        return _sticky_order_count(crm, date_str)
+    if name == "konnektive":
+        return _konnektive_order_count(crm, date_str)
+    if name == "vrio":
+        return _vrio_order_count(crm, date_str)
+    if name == "paysight":
+        return _paysight_order_count(crm, date_str)
+    print(f"Unsupported CRM for verification: {crm.CRM_NAME!r}")
+    return None, []
 
 
 def get_blob_order_data(client_id, target_date):
@@ -305,6 +423,48 @@ def verify_data(crm, target_date=None, dry_run=False):
 
     print(f"CRM API Order Count: {crm_count}")
 
+    # Non-Sticky CRMs: 2-way API vs DB check (no processed-blob layer to inspect)
+    crm_name = (getattr(crm, "CRM_NAME", "") or "").strip().lower()
+    if crm_name != "sticky":
+        print(f"\n--- Step 2: API vs DB Comparison ({crm.CRM_NAME}) ---")
+        db_count = get_db_order_count(crm.CLIENT_ID, date_str)
+        if db_count is None:
+            print("FAILED: Could not fetch database order count")
+            if not dry_run:
+                update_data_verified_status(crm.CLIENT_ID, False)
+            return {"status": "ERROR", "client_id": crm.CLIENT_ID, "client_name": crm.CLIENT_NAME, "date": date_str, "error": "Failed to fetch database order count"}
+
+        if max(crm_count, db_count) > 0:
+            api_db_pct = min(crm_count, db_count) / max(crm_count, db_count) * 100
+        else:
+            api_db_pct = 100.0
+
+        api_db_pass = api_db_pct >= (BLOB_DB_THRESHOLD * 100)
+        print(f"CRM API Count:   {crm_count}")
+        print(f"DB Order Count:  {db_count}")
+        print(f"Match:           {api_db_pct:.2f}%   Threshold: {BLOB_DB_THRESHOLD * 100}%")
+        print(f"Status:          {'PASS' if api_db_pass else 'FAIL'}")
+        if not api_db_pass:
+            print(f"Difference:      {abs(crm_count - db_count)}")
+
+        status = "PASS" if api_db_pass else "FAIL"
+        print(f"\n{'='*60}\nVerification Status:     {status}\n{'='*60}\n")
+        if not dry_run:
+            update_data_verified_status(crm.CLIENT_ID, bool(api_db_pass))
+        return {
+            "status": status,
+            "client_id": crm.CLIENT_ID,
+            "client_name": crm.CLIENT_NAME,
+            "date": date_str,
+            "crm_count": crm_count,
+            "blob_total": None,
+            "blob_non_test": None,
+            "blob_test": None,
+            "db_count": db_count,
+            "api_db_pct": round(api_db_pct, 2),
+            "is_verified": api_db_pass,
+        }
+
     # Step 2: Get Blob order count (deduplicated)
     print(f"\n--- Step 2: Azure Blob Order Count ---")
     blob_total, blob_non_test, blob_test, _ = get_blob_order_data(crm.CLIENT_ID, target_date)
@@ -386,6 +546,11 @@ def verify_data(crm, target_date=None, dry_run=False):
     if not dry_run:
         update_data_verified_status(crm.CLIENT_ID, bool(is_verified))
 
+    api_db_pct = (
+        round(min(crm_count, db_count) / max(crm_count, db_count) * 100, 2)
+        if max(crm_count, db_count) > 0 else 100.0
+    )
+
     return {
         "status": status,
         "client_id": crm.CLIENT_ID,
@@ -396,6 +561,7 @@ def verify_data(crm, target_date=None, dry_run=False):
         "blob_non_test": blob_non_test,
         "blob_test": blob_test,
         "db_count": db_count,
+        "api_db_pct": api_db_pct,
         "is_verified": is_verified,
     }
 

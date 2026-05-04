@@ -20,3 +20,12 @@ ENV/
 
 # OS
 .DS_Store
+
+# Verification artifacts
+*_verification_*.xlsx
+*_weekly_verification_*.xlsx
+missing_orders_*.csv
+truly_missing_*.csv
+
+# Local tooling / IDE metadata
+.claude/
