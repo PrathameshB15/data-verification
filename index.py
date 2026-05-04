@@ -168,13 +168,14 @@ def _konnektive_base_url(client_id):
     return None
 
 
-def _konnektive_order_count(crm, date_str):
-    """Konnektive /order/query/: returns message.totalResults on first page (no pagination needed for count)."""
+def _konnektive_txn_count(crm, date_str, txn_type):
+    """Single /transactions/query/ call filtered by txnType + responseType=SUCCESS.
+    Reads message.totalResults; returns int or None on failure."""
     base = _konnektive_base_url(crm.CLIENT_ID)
     if not base:
         print("Konnektive API URL not configured (set [production] KONNEKTIVE_API_URL in config.ini)")
-        return None, []
-    url = f"{base}/order/query/"
+        return None
+    url = f"{base}/transactions/query/"
     params = {
         "loginId": crm.CRM_USERNAME,
         "password": crm.CRM_PASSWORD,
@@ -182,24 +183,39 @@ def _konnektive_order_count(crm, date_str):
         "resultsPerPage": 200,
         "startDate": date_str,
         "endDate": date_str,
+        "dateRangeType": "dateCreated",
+        "txnType": txn_type,
+        "responseType": "SUCCESS",
+        "includeBlacklist": 1,
     }
     try:
         r = requests.post(url, params=params, timeout=60)
-        if r.status_code != 200:
-            print(f"Konnektive API request failed: {r.status_code}")
-            return None, []
-        body = r.json()
-        msg = body.get("message") or {}
-        if isinstance(msg, dict) and "totalResults" in msg:
-            return int(msg["totalResults"]), []
-        # API returns string "EMPTY" or {result:"ERROR"} when no orders for the date
-        if body.get("result") == "ERROR" or msg == "EMPTY":
-            return 0, []
-        print(f"Konnektive API: unexpected response shape: {body!r}"[:300])
-        return None, []
     except requests.RequestException as e:
-        print(f"Error calling Konnektive API: {e}")
+        print(f"Error calling Konnektive /transactions/query/ ({txn_type}): {e}")
+        return None
+    if r.status_code != 200:
+        print(f"Konnektive /transactions/query/ ({txn_type}) failed: {r.status_code}")
+        return None
+    body = r.json()
+    msg = body.get("message") or {}
+    if isinstance(msg, dict) and "totalResults" in msg:
+        return int(msg["totalResults"])
+    if body.get("result") == "ERROR" or msg == "EMPTY":
+        return 0
+    print(f"Konnektive /transactions/query/ ({txn_type}): unexpected response: {body!r}"[:300])
+    return None
+
+
+def _konnektive_order_count(crm, date_str):
+    """Konnektive: count SALE + AUTHORIZE successful transactions (matches the rows
+    that land in data.konnektive_transactions_{client_id})."""
+    sale = _konnektive_txn_count(crm, date_str, "SALE")
+    auth = _konnektive_txn_count(crm, date_str, "AUTHORIZE")
+    if sale is None or auth is None:
         return None, []
+    total = sale + auth
+    print(f"Konnektive {date_str}: SALE={sale}, AUTHORIZE={auth}, total={total}")
+    return total, []
 
 
 def _vrio_order_count(crm, date_str):
@@ -343,6 +359,18 @@ def get_db_order_count(client_id, date_str):
     Fetch the count of orders from the database for a specific date.
     Uses data.orders_{client_id} table with end_date = '9999-12-31' filter.
     """
+    return _db_count(
+        f"""
+        SELECT COUNT(1) FROM data.orders_{client_id}
+        WHERE date_of_sale = %s AND end_date = '9999-12-31'
+        """,
+        (datetime.strptime(date_str, "%m/%d/%Y").strftime("%Y-%m-%d"),),
+    )
+
+
+def _db_count(sql, params):
+    """Run a single COUNT(*) SQL and return the integer (or None on failure)."""
+    conn = cur = None
     try:
         conn = psycopg2.connect(
             user=PSG_USER,
@@ -352,36 +380,38 @@ def get_db_order_count(client_id, date_str):
             database=PSG_DATABASE,
         )
         cur = conn.cursor()
-
-        # Convert date format from MM/DD/YYYY to YYYY-MM-DD for SQL
-        date_obj = datetime.strptime(date_str, "%m/%d/%Y")
-        sql_date = date_obj.strftime("%Y-%m-%d")
-
-        table_name = f"data.orders_{client_id}"
-        sql = f"""
-            SELECT COUNT(1)
-            FROM {table_name}
-            WHERE date_of_sale = %s
-              AND end_date = '9999-12-31'
-        """
-        cur.execute(sql, (sql_date,))
-        result = cur.fetchone()
-        count = result[0] if result else 0
-
-        return count
-
+        cur.execute(sql, params)
+        row = cur.fetchone()
+        return row[0] if row else 0
     except Exception as e:
-        print(f"Error fetching order count from database: {e}")
+        print(f"Error fetching count from database: {e}")
         return None
     finally:
         try:
-            cur.close()
+            if cur:
+                cur.close()
         except Exception:
             pass
         try:
-            conn.close()
+            if conn:
+                conn.close()
         except Exception:
             pass
+
+
+def get_konnektive_db_count(client_id, date_str):
+    """Count of SALE/AUTHORIZE rows in data.konnektive_transactions_{client_id}
+    for the given date (matches the API /transactions/query/ unit)."""
+    sql_date = datetime.strptime(date_str, "%m/%d/%Y").strftime("%Y-%m-%d")
+    return _db_count(
+        f"""
+        SELECT COUNT(1) FROM data.konnektive_transactions_{client_id}
+        WHERE txn_type IN ('SALE', 'AUTHORIZE')
+          AND date_created::date = %s
+          AND end_date = '9999-12-31'
+        """,
+        (sql_date,),
+    )
 
 
 def update_data_verified_status(client_id, is_verified):
@@ -453,7 +483,10 @@ def verify_data(crm, target_date=None, dry_run=False):
     crm_name = (getattr(crm, "CRM_NAME", "") or "").strip().lower()
     if crm_name != "sticky":
         print(f"\n--- Step 2: API vs DB Comparison ({crm.CRM_NAME}) ---")
-        db_count = get_db_order_count(crm.CLIENT_ID, date_str)
+        if crm_name == "konnektive":
+            db_count = get_konnektive_db_count(crm.CLIENT_ID, date_str)
+        else:
+            db_count = get_db_order_count(crm.CLIENT_ID, date_str)
         if db_count is None:
             print("FAILED: Could not fetch database order count")
             if not dry_run:
