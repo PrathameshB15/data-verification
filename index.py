@@ -169,7 +169,9 @@ def _konnektive_base_url(client_id):
 
 
 def _konnektive_txn_count(crm, date_str, txn_type):
-    """Single /transactions/query/ call filtered by txnType + responseType=SUCCESS.
+    """Single /transactions/query/ call. Mirrors production fetch_transactions_by_type
+    (is_success=None, includeBlacklist=1, dateRangeType=dateCreated) so the count
+    matches what's ingested into data.konnektive_transactions_{client_id}.
     Reads message.totalResults; returns int or None on failure."""
     base = _konnektive_base_url(crm.CLIENT_ID)
     if not base:
@@ -185,7 +187,6 @@ def _konnektive_txn_count(crm, date_str, txn_type):
         "endDate": date_str,
         "dateRangeType": "dateCreated",
         "txnType": txn_type,
-        "responseType": "SUCCESS",
         "includeBlacklist": 1,
     }
     try:
