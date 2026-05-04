@@ -16,17 +16,101 @@ Usage:
 """
 
 import argparse
+import configparser
 import sys
 import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
 import pandas as pd
+import requests
 
 from index import get_crm_credentials, verify_data
 
 
 DEMO_CLIENT_IDS = {10000, 10027}
+TELEGRAM_TIMEOUT = 15
+TELEGRAM_MAX_LEN = 4000  # Telegram cap is 4096; leave headroom
+
+
+def _telegram_credentials():
+    cfg = configparser.ConfigParser()
+    cfg.read("config.ini")
+    if not cfg.has_section("telegram"):
+        return None, None
+    token = cfg.get("telegram", "BOT_TOKEN", fallback="").strip()
+    chat_id = cfg.get("telegram", "CHAT_ID", fallback="").strip()
+    if not token or not chat_id:
+        return None, None
+    if not token.startswith("bot"):
+        token = "bot" + token
+    return token, chat_id
+
+
+def send_telegram(message):
+    token, chat_id = _telegram_credentials()
+    if not token or not chat_id:
+        print("Telegram: BOT_TOKEN/CHAT_ID not set in config.ini; skipping notification")
+        return False
+    url = f"https://api.telegram.org/{token}/sendMessage"
+    try:
+        r = requests.post(
+            url,
+            data={"chat_id": chat_id, "text": message[:TELEGRAM_MAX_LEN], "parse_mode": "HTML"},
+            timeout=TELEGRAM_TIMEOUT,
+        )
+        if r.status_code != 200:
+            print(f"Telegram send failed: {r.status_code} {r.text[:200]}")
+            return False
+        return True
+    except requests.RequestException as e:
+        print(f"Telegram send error: {e}")
+        return False
+
+
+def build_failure_message(crm_name, start_date, end_date, results):
+    """Group FAIL/ERROR results by client and produce a Telegram-friendly message."""
+    by_client = defaultdict(list)
+    for r in results:
+        if r.get("status") not in ("FAIL", "ERROR"):
+            continue
+        key = (r.get("client_id"), r.get("client_name") or "?")
+        by_client[key].append(r)
+
+    if not by_client:
+        return None
+
+    total_fail = sum(1 for r in results if r.get("status") == "FAIL")
+    total_err = sum(1 for r in results if r.get("status") == "ERROR")
+    range_str = f"{start_date.strftime('%m/%d/%Y')} → {end_date.strftime('%m/%d/%Y')}"
+
+    lines = [
+        f"<b>Weekly verification — {crm_name}</b>",
+        f"Range: {range_str}",
+        f"Failures: {total_fail} | Errors: {total_err} | Clients affected: {len(by_client)}",
+        "",
+    ]
+    for (cid, cname), rows in sorted(by_client.items(), key=lambda kv: kv[0][0] or 0):
+        rows.sort(key=lambda r: r.get("date", ""))
+        lines.append(f"<b>{cname}</b> ({cid}):")
+        for r in rows:
+            date = r.get("date", "?")
+            if r.get("status") == "ERROR":
+                lines.append(f"  • {date} — ERROR: {r.get('error', 'unknown')}")
+            else:
+                non_test = r.get("blob_non_test")
+                db = r.get("db_count")
+                api = r.get("crm_count")
+                api_str = f"API {api}" if isinstance(api, int) else "API ?"
+                if isinstance(non_test, int) and isinstance(db, int):
+                    lines.append(f"  • {date} — {api_str}, blob {non_test} vs DB {db} (Δ{abs(non_test - db)})")
+                elif isinstance(api, int) and isinstance(db, int):
+                    lines.append(f"  • {date} — {api_str} vs DB {db} (Δ{abs(api - db)}, {r.get('api_db_pct')}%)")
+                else:
+                    lines.append(f"  • {date} — {api_str} — FAIL")
+        lines.append("")
+    return "\n".join(lines).rstrip()
 
 
 def verify_with_retry(crm, target_date, max_retries, backoff_base=5):
@@ -90,6 +174,7 @@ def main():
     parser.add_argument("--retries", type=int, default=2, help="Retries on ERROR per (client, date) (default: 2)")
     parser.add_argument("--max-date-workers", type=int, default=3, help="Parallel dates per client (default: 3)")
     parser.add_argument("--no-export", action="store_true", help="Skip xlsx export")
+    parser.add_argument("--no-telegram", action="store_true", help="Skip the Telegram failure notification")
     parser.add_argument(
         "--exclude-clients",
         type=str,
@@ -188,6 +273,12 @@ def main():
     )
     if filename:
         print(f"Report: {filename}")
+
+    if (failed > 0 or errors > 0) and not args.no_telegram:
+        msg = build_failure_message(args.crm, start_date, end_date, all_results)
+        if msg:
+            ok = send_telegram(msg)
+            print(f"Telegram: {'sent' if ok else 'failed/skipped'} ({failed} fail, {errors} error)")
 
     if failed > 0 or errors > 0:
         sys.exit(1)
