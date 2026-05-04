@@ -153,9 +153,28 @@ def _sticky_order_count(crm, date_str):
     return len(merged), merged
 
 
+CHECKOUTCHAMP_CLIENT_IDS = {"10057", "10058", "10062", "10067"}
+
+
+def _konnektive_base_url(client_id):
+    """Konnektive base URL is fixed per-tenant, not stored in cc.host. A handful of
+    clients are routed to CheckoutChamp; everything else uses [production] KONNEKTIVE_API_URL."""
+    if str(client_id) in CHECKOUTCHAMP_CLIENT_IDS:
+        return "https://api.checkoutchamp.com"
+    if config.has_section("production") and config.has_option("production", "KONNEKTIVE_API_URL"):
+        base = config.get("production", "KONNEKTIVE_API_URL").strip().rstrip("/")
+        if base:
+            return base
+    return None
+
+
 def _konnektive_order_count(crm, date_str):
     """Konnektive /order/query/: returns message.totalResults on first page (no pagination needed for count)."""
-    url = f"https://{crm.CRM_HOST}/order/query/"
+    base = _konnektive_base_url(crm.CLIENT_ID)
+    if not base:
+        print("Konnektive API URL not configured (set [production] KONNEKTIVE_API_URL in config.ini)")
+        return None, []
+    url = f"{base}/order/query/"
     params = {
         "loginId": crm.CRM_USERNAME,
         "password": crm.CRM_PASSWORD,
