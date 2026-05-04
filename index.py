@@ -28,7 +28,10 @@ PSG_HOST = config.get("database", "PSG_HOST")
 PSG_PORT = int(config.get("database", "PSG_PORT"))
 PSG_DATABASE = config.get("database", "PSG_DATABASE")
 
-BLOB_CONTAINER_URL = config.get("azure", "BLOB_CONTAINER_URL")
+BLOB_CONTAINER_URL = (
+    config.get("azure", "BLOB_CONTAINER_URL", fallback="").strip()
+    if config.has_section("azure") else ""
+)
 
 API_BLOB_THRESHOLD = 0.99  # 99% match between API and Blob
 BLOB_DB_THRESHOLD = 0.99   # 99% match between Blob (non-test) and DB
@@ -260,6 +263,10 @@ def get_blob_order_data(client_id, target_date):
     month = target_date.strftime("%m")
     day = target_date.strftime("%d")
     prefix = f"sticky/{client_id}/{year}/{month}/{day}/"
+
+    if not BLOB_CONTAINER_URL:
+        print("Error: [azure] BLOB_CONTAINER_URL is not set in config.ini — required for Sticky verification")
+        return None, None, None, None
 
     try:
         container_client = ContainerClient.from_container_url(BLOB_CONTAINER_URL)
