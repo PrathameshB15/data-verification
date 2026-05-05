@@ -8,6 +8,7 @@ Verifies order data through a 3-step pipeline:
 
 import argparse
 import configparser
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -288,37 +289,114 @@ def _vrio_order_count(crm, date_str):
     return non_test_count, []
 
 
-def _paysight_order_count(crm, date_str):
-    """Paysight POST /api/transactions/search: paginate (limit=1000) until moreResults=false."""
-    url = f"{crm.CRM_HOST.rstrip('/')}/api/transactions/search" if "://" in (crm.CRM_HOST or "") else f"https://{crm.CRM_HOST}/api/transactions/search"
-    headers = {
+PAYSIGHT_PAGE_LIMIT = 1000
+PAYSIGHT_RETRY_BACKOFF = [5, 15, 30, 60, 120]
+
+
+def _paysight_url(crm):
+    host = (crm.CRM_HOST or "").strip().rstrip("/")
+    return f"{host}/api/transactions/search" if "://" in host else f"https://{host}/api/transactions/search"
+
+
+def _paysight_headers(crm):
+    return {
         "Authorization": crm.CRM_PASSWORD,
-        "ClientId": crm.CRM_API_KEY,
-        "UserEmail": crm.CRM_USERNAME,
+        "ClientId": str(crm.CRM_API_KEY),
         "Content-Type": "application/json",
+        "UserEmail": crm.CRM_USERNAME,
     }
-    sql_date = datetime.strptime(date_str, "%m/%d/%Y").strftime("%Y-%m-%d")
-    page = 1
-    total = 0
-    while True:
-        body = {"pageNumber": page, "limit": 1000, "dateFrom": sql_date, "dateTo": sql_date, "dateCompleted": True}
+
+
+def _paysight_is_order(txn):
+    """Mirror paysight.py is_order_transaction: drop alerts, Visa Fraud (TC40),
+    refund/chargeback children/orphans, etc."""
+    alert_source = txn.get("alertSource")
+    refund_source = txn.get("refundSource")
+    application = txn.get("application", "")
+    if alert_source == "Unassigned":
+        alert_source = None
+    if refund_source == "Unassigned":
+        refund_source = None
+    if alert_source is not None:
+        return False
+    if application == "Visa Fraud (TC40)":
+        return False
+    ancestor = txn.get("originalTransactionId")
+    is_approved = txn.get("success", False)
+    is_refund = txn.get("refunded", False)
+    is_chargeback = txn.get("chargedBack", False)
+    if ancestor and (refund_source is not None or is_refund):
+        return False
+    if ancestor and is_chargeback and not is_approved:
+        return False
+    if not ancestor and is_chargeback and not is_approved:
+        return False
+    return True
+
+
+def _paysight_fetch_page(crm, sql_date, page_number):
+    """Single paginated POST with retry/backoff. Returns (transactions, more_results) or (None, False) on hard error."""
+    payload = {
+        "pageNumber": page_number,
+        "limit": PAYSIGHT_PAGE_LIMIT,
+        "dateFrom": sql_date,
+        "dateTo": sql_date,
+        "dateCompleted": True,
+    }
+    url = _paysight_url(crm)
+    headers = _paysight_headers(crm)
+    for attempt in range(len(PAYSIGHT_RETRY_BACKOFF) + 1):
         try:
-            r = requests.post(url, json=body, headers=headers, timeout=60)
+            r = requests.post(url, json=payload, headers=headers, timeout=120)
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("success"):
+                    return data.get("transactions", []) or [], bool(data.get("moreResults", False))
+                print(f"Paysight API success=false (page {page_number}): {data.get('message')}")
+                return [], False
+            if r.status_code == 429 or r.status_code >= 500:
+                wait = PAYSIGHT_RETRY_BACKOFF[min(attempt, len(PAYSIGHT_RETRY_BACKOFF) - 1)]
+                print(f"Paysight API {r.status_code} (page {page_number}), retrying in {wait}s")
+                time.sleep(wait)
+                continue
+            print(f"Paysight API {r.status_code}: {r.text[:200]}")
+            return None, False
+        except requests.exceptions.Timeout:
+            wait = PAYSIGHT_RETRY_BACKOFF[min(attempt, len(PAYSIGHT_RETRY_BACKOFF) - 1)]
+            print(f"Paysight API timeout (page {page_number}), retrying in {wait}s")
+            time.sleep(wait)
         except requests.RequestException as e:
-            print(f"Error calling Paysight API (page {page}): {e}")
-            return None, []
-        if r.status_code != 200:
-            print(f"Paysight API request failed (page {page}): {r.status_code}")
-            return None, []
-        data = r.json()
-        txs = data.get("transactions") or []
-        total += len(txs)
-        if not data.get("moreResults"):
-            return total, []
+            print(f"Paysight API error (page {page_number}): {e}")
+            return None, False
+    return None, False
+
+
+def _paysight_counts(crm, date_str):
+    """Walk Paysight pagination for the date and return (crm_total, crm_orders) or (None, None)."""
+    sql_date = datetime.strptime(date_str, "%m/%d/%Y").strftime("%Y-%m-%d")
+    crm_total = 0
+    crm_orders = 0
+    page = 1
+    while True:
+        txns, more = _paysight_fetch_page(crm, sql_date, page)
+        if txns is None:
+            return None, None
+        if page == 1 and not txns and not more:
+            return None, None
+        crm_total += len(txns)
+        crm_orders += sum(1 for t in txns if _paysight_is_order(t))
+        if not more:
+            break
         page += 1
-        if page > 100:
-            print(f"Paysight API: aborting after 100 pages on {date_str} — possible runaway")
-            return None, []
+        time.sleep(1)
+    return crm_total, crm_orders
+
+
+def _paysight_order_count(crm, date_str):
+    """Paysight: filtered (orders) count — used by the generic dispatch when verify_data
+    isn't paysight-aware. The full 3-way verify lives in _verify_paysight."""
+    total, orders = _paysight_counts(crm, date_str)
+    return (None if orders is None else orders), []
 
 
 def get_crm_order_count(crm, date_str):
@@ -477,6 +555,34 @@ def get_vrio_db_count(client_id, date_str):
     )
 
 
+def get_paysight_raw_db_count(client_id, date_str):
+    """Count of rows in the raw staging table data.paysight_{client_id} for the date.
+    Compares against API total (unfiltered)."""
+    sql_date = datetime.strptime(date_str, "%m/%d/%Y").strftime("%Y-%m-%d")
+    return _db_count(
+        f"""
+        SELECT COUNT(1) FROM data.paysight_{client_id}
+        WHERE date_of_sale::date = %s
+          AND end_date = '9999-12-31'
+        """,
+        (sql_date,),
+    )
+
+
+def get_paysight_orders_db_count(client_id, date_str):
+    """Count of rows in data.orders_{client_id} (orders table). Compares against
+    API filtered count (orders only — excludes alerts/Visa-Fraud/refund-children/etc)."""
+    sql_date = datetime.strptime(date_str, "%m/%d/%Y").strftime("%Y-%m-%d")
+    return _db_count(
+        f"""
+        SELECT COUNT(1) FROM data.orders_{client_id}
+        WHERE date_of_sale::date = %s
+          AND end_date = '9999-12-31'
+        """,
+        (sql_date,),
+    )
+
+
 def update_data_verified_status(client_id, is_verified):
     """
     Update the data_verified column in beast_insights_v2.clients_pipeline_status table.
@@ -515,6 +621,67 @@ def update_data_verified_status(client_id, is_verified):
         conn.close()
 
 
+VRIO_PAYSIGHT_THRESHOLD = 0.90  # vrio.py and paysight.py both pass at 90%
+
+
+def _verify_paysight(crm, target_date, date_str, dry_run):
+    """Mirror paysight.py: dual API↔DB check (raw paysight table + filtered orders table)
+    with 90% threshold; PASS only if both checks pass."""
+    api_date = target_date.strftime("%Y-%m-%d")
+    print(f"\n--- Paysight: fetching transactions for {api_date} ---")
+    crm_total, crm_orders = _paysight_counts(crm, api_date)
+    if crm_total is None:
+        print("FAILED: Could not fetch CRM transaction count")
+        if not dry_run:
+            update_data_verified_status(crm.CLIENT_ID, False)
+        return {"status": "ERROR", "client_id": crm.CLIENT_ID, "client_name": crm.CLIENT_NAME, "date": date_str, "error": "Failed to fetch CRM transaction count"}
+
+    print(f"CRM Total:  {crm_total}   CRM Orders (filtered): {crm_orders}")
+
+    paysight_count = get_paysight_raw_db_count(crm.CLIENT_ID, date_str)
+    orders_count = get_paysight_orders_db_count(crm.CLIENT_ID, date_str)
+    if paysight_count is None or orders_count is None:
+        print("FAILED: Could not fetch database counts")
+        if not dry_run:
+            update_data_verified_status(crm.CLIENT_ID, False)
+        return {"status": "ERROR", "client_id": crm.CLIENT_ID, "client_name": crm.CLIENT_NAME, "date": date_str, "error": "Failed to fetch database counts"}
+
+    paysight_pct = (paysight_count / crm_total * 100) if crm_total > 0 else (100.0 if paysight_count == 0 else 0.0)
+    orders_pct = (orders_count / crm_orders * 100) if crm_orders > 0 else (100.0 if orders_count == 0 else 0.0)
+    threshold_pct = VRIO_PAYSIGHT_THRESHOLD * 100
+    paysight_pass = paysight_pct >= threshold_pct
+    orders_pass = orders_pct >= threshold_pct
+    is_verified = paysight_pass and orders_pass
+    status = "PASS" if is_verified else "FAIL"
+
+    print(f"\n[paysight {crm.CLIENT_ID}] {date_str}:")
+    print(f"  data.paysight_{crm.CLIENT_ID}: {paysight_count}/{crm_total} ({paysight_pct:.2f}%)  {'PASS' if paysight_pass else 'FAIL'}")
+    print(f"  data.orders_{crm.CLIENT_ID}:   {orders_count}/{crm_orders} ({orders_pct:.2f}%)  {'PASS' if orders_pass else 'FAIL'}")
+    print(f"  Threshold: {threshold_pct}%   Status: {status}")
+
+    if not dry_run:
+        update_data_verified_status(crm.CLIENT_ID, bool(is_verified))
+
+    # api_db_pct uses the orders comparison (the more meaningful one) so the existing column doesn't break
+    return {
+        "status": status,
+        "client_id": crm.CLIENT_ID,
+        "client_name": crm.CLIENT_NAME,
+        "date": date_str,
+        "crm_count": crm_orders,            # treat filtered orders as the headline API number
+        "crm_total": crm_total,             # also expose unfiltered total
+        "blob_total": None,
+        "blob_non_test": None,
+        "blob_test": None,
+        "db_count": orders_count,
+        "paysight_db_count": paysight_count,
+        "paysight_pct": round(paysight_pct, 2),
+        "orders_pct": round(orders_pct, 2),
+        "api_db_pct": round(orders_pct, 2),
+        "is_verified": is_verified,
+    }
+
+
 def verify_data(crm, target_date=None, dry_run=False):
     """
     Verify data through 3-step pipeline:
@@ -530,6 +697,10 @@ def verify_data(crm, target_date=None, dry_run=False):
     print(f"Data Verification for {crm.CLIENT_NAME} (Client ID: {crm.CLIENT_ID})")
     print(f"Date: {date_str}")
     print(f"{'='*60}")
+
+    crm_name_early = (getattr(crm, "CRM_NAME", "") or "").strip().lower()
+    if crm_name_early == "paysight":
+        return _verify_paysight(crm, target_date, date_str, dry_run)
 
     # Step 1: Get CRM API order count
     print(f"\n--- Step 1: CRM API Order Count ---")
@@ -563,10 +734,11 @@ def verify_data(crm, target_date=None, dry_run=False):
         else:
             api_db_pct = 100.0
 
-        api_db_pass = api_db_pct >= (BLOB_DB_THRESHOLD * 100)
+        threshold = VRIO_PAYSIGHT_THRESHOLD if crm_name == "vrio" else BLOB_DB_THRESHOLD
+        api_db_pass = api_db_pct >= (threshold * 100)
         print(f"CRM API Count:   {crm_count}")
         print(f"DB Order Count:  {db_count}")
-        print(f"Match:           {api_db_pct:.2f}%   Threshold: {BLOB_DB_THRESHOLD * 100}%")
+        print(f"Match:           {api_db_pct:.2f}%   Threshold: {threshold * 100}%")
         print(f"Status:          {'PASS' if api_db_pass else 'FAIL'}")
         if not api_db_pass:
             print(f"Difference:      {abs(crm_count - db_count)}")

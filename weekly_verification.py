@@ -103,8 +103,17 @@ def build_failure_message(crm_name, start_date, end_date, results):
                 blob_total = r.get("blob_total")
                 non_test = r.get("blob_non_test")
                 db = r.get("db_count")
+                paysight_db = r.get("paysight_db_count")
+                crm_total = r.get("crm_total")
                 api_str = f"API {api}" if isinstance(api, int) else "API ?"
-                if isinstance(blob_total, int) and isinstance(non_test, int) and isinstance(db, int):
+                if isinstance(crm_total, int) and isinstance(paysight_db, int) and isinstance(api, int) and isinstance(db, int):
+                    # Paysight 3-way: API total, API orders, raw paysight DB, orders DB
+                    lines.append(
+                        f"  • {date} — API total {crm_total} → paysight {paysight_db} "
+                        f"({r.get('paysight_pct')}%), API orders {api} → orders {db} "
+                        f"({r.get('orders_pct')}%)"
+                    )
+                elif isinstance(blob_total, int) and isinstance(non_test, int) and isinstance(db, int):
                     lines.append(
                         f"  • {date} — {api_str}, blob {blob_total} "
                         f"(non-test {non_test}), DB {db} (Δ{abs(non_test - db)})"
