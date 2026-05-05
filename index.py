@@ -219,25 +219,58 @@ def _konnektive_order_count(crm, date_str):
     return total, []
 
 
-def _vrio_order_count(crm, date_str):
-    """Vrio GET /orders: response 'total' field gives the count; first page is enough."""
-    url = f"https://{crm.CRM_HOST}/orders" if crm.CRM_HOST else "https://api.vrio.app/orders"
+VRIO_PRIMARY_TXN_TYPES = (1, 6, 7, 8)  # SALE, AUTH, CAPTURE, COD — match sync_vrio_orders.py
+
+
+def _vrio_base_url(crm):
+    host = (getattr(crm, "CRM_HOST", "") or "").strip()
+    if not host or host.lower() == "none":
+        return "https://api.vrio.app"
+    return host if "://" in host else f"https://{host}"
+
+
+def _vrio_txn_count(crm, date_str, txn_type):
+    """Single /transactions call mirroring sync_vrio_orders.fetch_and_transform_transaction_data_by_type
+    (transaction_status=2 Completed, date_complete window). Returns response 'total' (int) or None."""
+    url = f"{_vrio_base_url(crm).rstrip('/')}/transactions"
     headers = {"X-Api-Key": crm.CRM_API_KEY}
     sql_date = datetime.strptime(date_str, "%m/%d/%Y").strftime("%Y-%m-%d")
-    params = {"offset": 0, "limit": 1, "date_created_from": sql_date, "date_created_to": sql_date}
+    params = {
+        "offset": 0,
+        "limit": 1,
+        "date_complete_from": sql_date,
+        "date_complete_to": sql_date,
+        "transaction_type_id": txn_type,
+        "transaction_status": 2,
+    }
     try:
         r = requests.get(url, headers=headers, params=params, timeout=60)
-        if r.status_code != 200:
-            print(f"Vrio API request failed: {r.status_code}")
-            return None, []
-        body = r.json()
-        if "total" in body:
-            return int(body["total"]), []
-        print(f"Vrio API: missing 'total' in response: {body!r}"[:300])
-        return None, []
     except requests.RequestException as e:
-        print(f"Error calling Vrio API: {e}")
-        return None, []
+        print(f"Error calling Vrio /transactions (type {txn_type}): {e}")
+        return None
+    if r.status_code != 200:
+        print(f"Vrio /transactions (type {txn_type}) failed: {r.status_code}")
+        return None
+    body = r.json()
+    if "total" in body:
+        return int(body["total"])
+    print(f"Vrio /transactions (type {txn_type}): missing 'total' in response: {body!r}"[:200])
+    return None
+
+
+def _vrio_order_count(crm, date_str):
+    """Vrio: sum of completed primary transactions (SALE+AUTH+CAPTURE+COD) — same set
+    sync_vrio_orders.py fetches before its is_test/test-email filter. The DB count
+    excludes test orders, so a small consistent gap is expected."""
+    parts = []
+    for tt in VRIO_PRIMARY_TXN_TYPES:
+        n = _vrio_txn_count(crm, date_str, tt)
+        if n is None:
+            return None, []
+        parts.append((tt, n))
+    total = sum(n for _, n in parts)
+    print(f"Vrio {date_str}: " + ", ".join(f"type{t}={n}" for t, n in parts) + f", total={total}")
+    return total, []
 
 
 def _paysight_order_count(crm, date_str):
