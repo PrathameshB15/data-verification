@@ -99,12 +99,16 @@ def build_failure_message(crm_name, start_date, end_date, results):
             if r.get("status") == "ERROR":
                 lines.append(f"  • {date} — ERROR: {r.get('error', 'unknown')}")
             else:
+                api = r.get("crm_count")
+                blob_total = r.get("blob_total")
                 non_test = r.get("blob_non_test")
                 db = r.get("db_count")
-                api = r.get("crm_count")
                 api_str = f"API {api}" if isinstance(api, int) else "API ?"
-                if isinstance(non_test, int) and isinstance(db, int):
-                    lines.append(f"  • {date} — {api_str}, blob {non_test} vs DB {db} (Δ{abs(non_test - db)})")
+                if isinstance(blob_total, int) and isinstance(non_test, int) and isinstance(db, int):
+                    lines.append(
+                        f"  • {date} — {api_str}, blob {blob_total} "
+                        f"(non-test {non_test}), DB {db} (Δ{abs(non_test - db)})"
+                    )
                 elif isinstance(api, int) and isinstance(db, int):
                     lines.append(f"  • {date} — {api_str} vs DB {db} (Δ{abs(api - db)}, {r.get('api_db_pct')}%)")
                 else:
