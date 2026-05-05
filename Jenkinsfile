@@ -82,6 +82,12 @@ pipeline {
     }
 
     stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
         stage('Setup') {
             steps {
                 sh '''
