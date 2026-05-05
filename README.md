@@ -3,7 +3,7 @@
 Weekly cross-CRM verification: compare API order counts against Azure Blob (where applicable) and the warehouse (`data.orders_<client_id>`) for each active client of a given CRM, then post failures to Telegram.
 
 - **Sticky**: 3-way check — API count vs deduped Blob count vs DB count.
-- **Konnektive / Vrio / Paysight**: 2-way check — API count vs DB count (no processed-blob layer).
+- **Konnektive / VRIO / Paysight**: 2-way check — API count vs DB count (no processed-blob layer).
 
 `weekly_verification.py` is the entry point; `index.py` holds the per-CRM API helpers and the `verify_data` flow.
 
@@ -35,13 +35,13 @@ pip install -r requirements.txt
 
 ## Running per CRM
 
-Same script, just change `--crm`. The value must match exactly what's stored in `beast_insights_v2.crms.name` (`Sticky`, `Konnektive`, `Vrio`, `Paysight`).
+Same script, just change `--crm`. The value must match exactly what's stored in `beast_insights_v2.crms.name` (`Sticky`, `Konnektive`, `VRIO`, `Paysight`).
 
 **Default — last 30 days, all active clients of that CRM:**
 ```
 python3 weekly_verification.py --crm Sticky
 python3 weekly_verification.py --crm Konnektive
-python3 weekly_verification.py --crm Vrio
+python3 weekly_verification.py --crm VRIO
 python3 weekly_verification.py --crm Paysight
 ```
 
@@ -52,7 +52,7 @@ python3 weekly_verification.py --crm Konnektive --client-id 10057
 
 **Explicit date range (overrides `--days`):**
 ```
-python3 weekly_verification.py --crm Vrio --start-date 2026-04-01 --end-date 2026-04-30
+python3 weekly_verification.py --crm VRIO --start-date 2026-04-01 --end-date 2026-04-30
 ```
 
 ## Flags
