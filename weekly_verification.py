@@ -69,6 +69,15 @@ def send_telegram(message):
         return False
 
 
+def build_clean_run_message(crm_name, start_date, end_date, n_clients, n_days):
+    range_str = f"{start_date.strftime('%m/%d/%Y')} → {end_date.strftime('%m/%d/%Y')}"
+    return (
+        f"<b>Weekly verification — {crm_name}</b>\n"
+        f"Range: {range_str}\n"
+        f"All clear ✅ — {n_clients} client(s) × {n_days} day(s), 0 failures, 0 errors"
+    )
+
+
 def build_failure_message(crm_name, start_date, end_date, results):
     """Group FAIL/ERROR results by client and produce a Telegram-friendly message."""
     by_client = defaultdict(list)
@@ -287,8 +296,11 @@ def main():
     if filename:
         print(f"Report: {filename}")
 
-    if (failed > 0 or errors > 0) and not args.no_telegram:
-        msg = build_failure_message(args.crm, start_date, end_date, all_results)
+    if not args.no_telegram:
+        if failed > 0 or errors > 0:
+            msg = build_failure_message(args.crm, start_date, end_date, all_results)
+        else:
+            msg = build_clean_run_message(args.crm, start_date, end_date, len(crm_list), len(dates))
         if msg:
             ok = send_telegram(msg)
             print(f"Telegram: {'sent' if ok else 'failed/skipped'} ({failed} fail, {errors} error)")
