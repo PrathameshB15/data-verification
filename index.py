@@ -342,8 +342,8 @@ def get_blob_order_data(client_id, target_date):
 
         # Identify test orders: IS_TEST == "True" or BILL_EMAIL contains 'test'
         test_mask = deduped["IS_TEST"].astype(str).str.lower().eq("true") | deduped["BILL_EMAIL"].str.contains("test", case=False, na=False)
-        test_count = test_mask.sum()
-        non_test_count = total_count - test_count
+        test_count = int(test_mask.sum())
+        non_test_count = int(total_count - test_count)
 
         print(f"Test orders: {test_count}")
         print(f"Non-test orders: {non_test_count}")
