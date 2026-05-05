@@ -4,11 +4,10 @@
 // every active client of every supported CRM (Sticky, Konnektive, VRIO,
 // Paysight). All parameters can be overridden when triggering manually.
 //
-// Prereq on the build node:
-//   - python3 + python3-venv (the build creates .venv in the workspace).
-//   - config.ini available at the path given by the CONFIG_PATH parameter
-//     (default /opt/beastinsights/data-verification/config.ini). It is
-//     copied into the workspace before each run so the script sees it.
+// This job runs against an existing checkout on the build node at
+// REPO_PATH (default /opt/beastinsights/data-verification). It does NOT
+// fetch the repo itself — keep the install up to date with `git pull`
+// from that path. Jenkins only needs python3 + python3-venv on PATH.
 
 pipeline {
     agent any
@@ -75,39 +74,30 @@ pipeline {
             description: 'Skip the Telegram notification.'
         )
         string(
-            name: 'CONFIG_PATH',
-            defaultValue: '/opt/beastinsights/data-verification/config.ini',
-            description: 'Where to copy config.ini from (it is gitignored, so it must live outside the repo).'
+            name: 'REPO_PATH',
+            defaultValue: '/opt/beastinsights/data-verification',
+            description: 'Existing checkout on the build node. The job runs `cd REPO_PATH` and uses its config.ini and .venv.'
         )
     }
 
     stages {
-        stage('Checkout') {
-            steps {
-                // Inline pipeline: pull the repo explicitly.
-                // If Jenkins needs creds, add: credentialsId: '<id>'  (or switch the
-                // job to "Pipeline script from SCM" and replace this with `checkout scm`).
-                git branch: 'main', url: 'git@github.com:PrathameshB15/data-verification.git'
-            }
-        }
-
         stage('Setup') {
             steps {
-                sh '''
-                    set -e
-                    if [ ! -f "${CONFIG_PATH}" ]; then
-                        echo "config.ini not found at ${CONFIG_PATH}"
-                        exit 1
-                    fi
-                    cp "${CONFIG_PATH}" config.ini
-                    chmod 600 config.ini
-                    if [ ! -x .venv/bin/python ]; then
-                        python3 -m venv .venv
-                    fi
-                    .venv/bin/pip install --quiet --upgrade pip
-                    .venv/bin/pip install --quiet -r requirements.txt
-                    .venv/bin/python -c "import index, weekly_verification"
-                '''
+                dir("${params.REPO_PATH}") {
+                    sh '''
+                        set -e
+                        if [ ! -f config.ini ]; then
+                            echo "config.ini missing in ${PWD}"
+                            exit 1
+                        fi
+                        if [ ! -x .venv/bin/python ]; then
+                            python3 -m venv .venv
+                        fi
+                        .venv/bin/pip install --quiet --upgrade pip
+                        .venv/bin/pip install --quiet -r requirements.txt
+                        .venv/bin/python -c "import index, weekly_verification"
+                    '''
+                }
             }
         }
 
@@ -144,12 +134,14 @@ pipeline {
                     def anyFailed = false
                     for (crm in crms) {
                         stage("verify ${crm}") {
-                            def cmd = ".venv/bin/python -u weekly_verification.py --crm ${crm} ${commonStr}"
-                            echo "Running: ${cmd}"
-                            def rc = sh(returnStatus: true, script: cmd)
-                            if (rc != 0) {
-                                anyFailed = true
-                                unstable("CRM ${crm} exited ${rc} — see logs / Telegram for failing dates")
+                            dir("${params.REPO_PATH}") {
+                                def cmd = ".venv/bin/python -u weekly_verification.py --crm ${crm} ${commonStr}"
+                                echo "Running: ${cmd}"
+                                def rc = sh(returnStatus: true, script: cmd)
+                                if (rc != 0) {
+                                    anyFailed = true
+                                    unstable("CRM ${crm} exited ${rc} — see logs / Telegram for failing dates")
+                                }
                             }
                         }
                     }
@@ -163,10 +155,9 @@ pipeline {
 
     post {
         always {
-            archiveArtifacts artifacts: '*_weekly_verification_*.xlsx', allowEmptyArchive: true, fingerprint: true
-        }
-        cleanup {
-            sh 'rm -f config.ini'
+            dir("${params.REPO_PATH}") {
+                archiveArtifacts artifacts: '*_weekly_verification_*.xlsx', allowEmptyArchive: true, fingerprint: true
+            }
         }
     }
 }
