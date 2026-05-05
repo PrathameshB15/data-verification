@@ -84,7 +84,10 @@ pipeline {
     stages {
         stage('Checkout') {
             steps {
-                checkout scm
+                // Inline pipeline: pull the repo explicitly.
+                // If Jenkins needs creds, add: credentialsId: '<id>'  (or switch the
+                // job to "Pipeline script from SCM" and replace this with `checkout scm`).
+                git branch: 'main', url: 'git@github.com:PrathameshB15/data-verification.git'
             }
         }
 
