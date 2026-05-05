@@ -5,8 +5,7 @@
 // Paysight). All parameters can be overridden when triggering manually.
 //
 // Prereq on the build node:
-//   - python3 + the packages in requirements.txt installed (or installable
-//     via pip in the workspace).
+//   - python3 + python3-venv (the build creates .venv in the workspace).
 //   - config.ini available at the path given by the CONFIG_PATH parameter
 //     (default /opt/beastinsights/data-verification/config.ini). It is
 //     copied into the workspace before each run so the script sees it.
@@ -93,8 +92,12 @@ pipeline {
                     fi
                     cp "${CONFIG_PATH}" config.ini
                     chmod 600 config.ini
-                    python3 -m pip install --quiet --user -r requirements.txt
-                    python3 -c "import index, weekly_verification"
+                    if [ ! -x .venv/bin/python ]; then
+                        python3 -m venv .venv
+                    fi
+                    .venv/bin/pip install --quiet --upgrade pip
+                    .venv/bin/pip install --quiet -r requirements.txt
+                    .venv/bin/python -c "import index, weekly_verification"
                 '''
             }
         }
@@ -132,7 +135,7 @@ pipeline {
                     def anyFailed = false
                     for (crm in crms) {
                         stage("verify ${crm}") {
-                            def cmd = "python3 -u weekly_verification.py --crm ${crm} ${commonStr}"
+                            def cmd = ".venv/bin/python -u weekly_verification.py --crm ${crm} ${commonStr}"
                             echo "Running: ${cmd}"
                             def rc = sh(returnStatus: true, script: cmd)
                             if (rc != 0) {
