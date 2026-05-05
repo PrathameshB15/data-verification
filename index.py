@@ -627,9 +627,8 @@ PAYSIGHT_THRESHOLD = 0.90  # paysight.py passes at 90% on both sub-checks
 def _verify_paysight(crm, target_date, date_str, dry_run):
     """Mirror paysight.py: dual API↔DB check (raw paysight table + filtered orders table)
     with 90% threshold; PASS only if both checks pass."""
-    api_date = target_date.strftime("%Y-%m-%d")
-    print(f"\n--- Paysight: fetching transactions for {api_date} ---")
-    crm_total, crm_orders = _paysight_counts(crm, api_date)
+    print(f"\n--- Paysight: fetching transactions for {target_date.strftime('%Y-%m-%d')} ---")
+    crm_total, crm_orders = _paysight_counts(crm, date_str)
     if crm_total is None:
         print("FAILED: Could not fetch CRM transaction count")
         if not dry_run:
