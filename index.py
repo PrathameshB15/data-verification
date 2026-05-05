@@ -220,6 +220,7 @@ def _konnektive_order_count(crm, date_str):
 
 
 VRIO_PRIMARY_TXN_TYPES = (1, 6, 7, 8)  # SALE, AUTH, CAPTURE, COD — match sync_vrio_orders.py
+VRIO_PAGE_SIZE = 200
 
 
 def _vrio_base_url(crm):
@@ -229,48 +230,62 @@ def _vrio_base_url(crm):
     return host if "://" in host else f"https://{host}"
 
 
-def _vrio_txn_count(crm, date_str, txn_type):
-    """Single /transactions call mirroring sync_vrio_orders.fetch_and_transform_transaction_data_by_type
-    (transaction_status=2 Completed, date_complete window). Returns response 'total' (int) or None."""
-    url = f"{_vrio_base_url(crm).rstrip('/')}/transactions"
-    headers = {"X-Api-Key": crm.CRM_API_KEY}
-    sql_date = datetime.strptime(date_str, "%m/%d/%Y").strftime("%Y-%m-%d")
-    params = {
-        "offset": 0,
-        "limit": 1,
-        "date_complete_from": sql_date,
-        "date_complete_to": sql_date,
-        "transaction_type_id": txn_type,
-        "transaction_status": 2,
-    }
-    try:
-        r = requests.get(url, headers=headers, params=params, timeout=60)
-    except requests.RequestException as e:
-        print(f"Error calling Vrio /transactions (type {txn_type}): {e}")
-        return None
-    if r.status_code != 200:
-        print(f"Vrio /transactions (type {txn_type}) failed: {r.status_code}")
-        return None
-    body = r.json()
-    if "total" in body:
-        return int(body["total"])
-    print(f"Vrio /transactions (type {txn_type}): missing 'total' in response: {body!r}"[:200])
-    return None
+def _vrio_is_test(txn):
+    """Mirror vrio.py is_test_order: any line item is_test=true, OR customer email contains 'test'."""
+    for item in txn.get("line_items", []) or []:
+        if item.get("is_test") in (True, "true", "True", 1, "1"):
+            return True
+    email = ((txn.get("customer") or {}).get("email") or "")
+    return "test" in email.lower()
 
 
 def _vrio_order_count(crm, date_str):
-    """Vrio: sum of completed primary transactions (SALE+AUTH+CAPTURE+COD) — same set
-    sync_vrio_orders.py fetches before its is_test/test-email filter. The DB count
-    excludes test orders, so a small consistent gap is expected."""
-    parts = []
-    for tt in VRIO_PRIMARY_TXN_TYPES:
-        n = _vrio_txn_count(crm, date_str, tt)
-        if n is None:
-            return None, []
-        parts.append((tt, n))
-    total = sum(n for _, n in parts)
-    print(f"Vrio {date_str}: " + ", ".join(f"type{t}={n}" for t, n in parts) + f", total={total}")
-    return total, []
+    """Vrio: sum of non-test line items across SALE/AUTH/CAPTURE/COD transactions for the day.
+    Mirrors vrio.py exactly: counts max(1, len(line_items)) per transaction, drops test orders."""
+    base_url = _vrio_base_url(crm).rstrip("/")
+    headers = {"accept": "application/json", "hostname": "api.vrio.app", "X-Api-Key": crm.CRM_API_KEY}
+    sql_date = datetime.strptime(date_str, "%m/%d/%Y").strftime("%Y-%m-%d")
+
+    total_count = 0
+    non_test_count = 0
+    for txn_type in VRIO_PRIMARY_TXN_TYPES:
+        offset = 0
+        while True:
+            params = {
+                "offset": offset,
+                "limit": VRIO_PAGE_SIZE,
+                "date_complete_from": sql_date,
+                "date_complete_to": sql_date,
+                "transaction_type_id": txn_type,
+                "transaction_status": 2,
+                "with": "customer,line_items",
+            }
+            try:
+                r = requests.get(f"{base_url}/transactions/", headers=headers, params=params, timeout=60)
+            except requests.RequestException as e:
+                print(f"Vrio /transactions/ (type {txn_type}) error: {e}")
+                return None, []
+            if r.status_code != 200:
+                print(f"Vrio /transactions/ (type {txn_type}) failed: {r.status_code}")
+                return None, []
+            body = r.json()
+            if body.get("result") == "ERROR":
+                if offset == 0 and txn_type == 1:
+                    return None, []
+                break
+            txns = body.get("transactions", []) or []
+            api_total = int(body.get("total", 0))
+            for txn in txns:
+                items = txn.get("line_items") or []
+                count = max(len(items), 1)
+                total_count += count
+                if not _vrio_is_test(txn):
+                    non_test_count += count
+            if offset + VRIO_PAGE_SIZE >= api_total:
+                break
+            offset += VRIO_PAGE_SIZE
+    print(f"Vrio {date_str}: total line items={total_count}, non-test={non_test_count}")
+    return non_test_count, []
 
 
 def _paysight_order_count(crm, date_str):
@@ -448,6 +463,20 @@ def get_konnektive_db_count(client_id, date_str):
     )
 
 
+def get_vrio_db_count(client_id, date_str):
+    """Non-test rows in data.orders_{client_id} for the date — matches vrio.py's filter."""
+    sql_date = datetime.strptime(date_str, "%m/%d/%Y").strftime("%Y-%m-%d")
+    return _db_count(
+        f"""
+        SELECT COUNT(1) FROM data.orders_{client_id}
+        WHERE date_of_sale = %s
+          AND end_date = '9999-12-31'
+          AND is_test_actual != 'Yes'
+        """,
+        (sql_date,),
+    )
+
+
 def update_data_verified_status(client_id, is_verified):
     """
     Update the data_verified column in beast_insights_v2.clients_pipeline_status table.
@@ -519,6 +548,8 @@ def verify_data(crm, target_date=None, dry_run=False):
         print(f"\n--- Step 2: API vs DB Comparison ({crm.CRM_NAME}) ---")
         if crm_name == "konnektive":
             db_count = get_konnektive_db_count(crm.CLIENT_ID, date_str)
+        elif crm_name == "vrio":
+            db_count = get_vrio_db_count(crm.CLIENT_ID, date_str)
         else:
             db_count = get_db_order_count(crm.CLIENT_ID, date_str)
         if db_count is None:
