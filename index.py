@@ -621,7 +621,7 @@ def update_data_verified_status(client_id, is_verified):
         conn.close()
 
 
-VRIO_PAYSIGHT_THRESHOLD = 0.90  # vrio.py and paysight.py both pass at 90%
+PAYSIGHT_THRESHOLD = 0.90  # paysight.py passes at 90% on both sub-checks
 
 
 def _verify_paysight(crm, target_date, date_str, dry_run):
@@ -648,7 +648,7 @@ def _verify_paysight(crm, target_date, date_str, dry_run):
 
     paysight_pct = (paysight_count / crm_total * 100) if crm_total > 0 else (100.0 if paysight_count == 0 else 0.0)
     orders_pct = (orders_count / crm_orders * 100) if crm_orders > 0 else (100.0 if orders_count == 0 else 0.0)
-    threshold_pct = VRIO_PAYSIGHT_THRESHOLD * 100
+    threshold_pct = PAYSIGHT_THRESHOLD * 100
     paysight_pass = paysight_pct >= threshold_pct
     orders_pass = orders_pct >= threshold_pct
     is_verified = paysight_pass and orders_pass
@@ -734,11 +734,10 @@ def verify_data(crm, target_date=None, dry_run=False):
         else:
             api_db_pct = 100.0
 
-        threshold = VRIO_PAYSIGHT_THRESHOLD if crm_name == "vrio" else BLOB_DB_THRESHOLD
-        api_db_pass = api_db_pct >= (threshold * 100)
+        api_db_pass = api_db_pct >= (BLOB_DB_THRESHOLD * 100)
         print(f"CRM API Count:   {crm_count}")
         print(f"DB Order Count:  {db_count}")
-        print(f"Match:           {api_db_pct:.2f}%   Threshold: {threshold * 100}%")
+        print(f"Match:           {api_db_pct:.2f}%   Threshold: {BLOB_DB_THRESHOLD * 100}%")
         print(f"Status:          {'PASS' if api_db_pass else 'FAIL'}")
         if not api_db_pass:
             print(f"Difference:      {abs(crm_count - db_count)}")
