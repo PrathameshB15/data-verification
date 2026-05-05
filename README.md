@@ -66,13 +66,13 @@ python3 weekly_verification.py --crm Vrio --start-date 2026-04-01 --end-date 202
 | `--retries` | `2` | Retries per (client, date) on ERROR |
 | `--max-date-workers` | `3` | Parallel dates per client |
 | `--exclude-clients` | `10000,10027` | Demo accounts skipped by default |
-| `--no-export` | off | Skip the xlsx report |
+| `--export` | off | Write the xlsx report (skipped by default) |
 | `--no-telegram` | off | Skip the Telegram failure summary |
 
 ## Outputs
 
 - **stdout**: per-(client, date) verification trace + a summary block.
-- **xlsx**: `<crm>_weekly_verification_<timestamp>.xlsx` (suppressed with `--no-export`).
+- **xlsx**: `<crm>_weekly_verification_<timestamp>.xlsx` — only when `--export` is passed.
 - **Telegram**: only sent when there's at least one FAIL or ERROR; lists each failing date per client with API count, blob count (Sticky), DB count, and delta.
 
 ## Exit codes

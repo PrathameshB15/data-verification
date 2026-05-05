@@ -195,7 +195,7 @@ def main():
     parser.add_argument("--end-date", type=str, default=None, help="End date YYYY-MM-DD (inclusive). Use with --start-date to override --days.")
     parser.add_argument("--retries", type=int, default=2, help="Retries on ERROR per (client, date) (default: 2)")
     parser.add_argument("--max-date-workers", type=int, default=3, help="Parallel dates per client (default: 3)")
-    parser.add_argument("--no-export", action="store_true", help="Skip xlsx export")
+    parser.add_argument("--export", action="store_true", help="Write xlsx report (default: skip)")
     parser.add_argument("--no-telegram", action="store_true", help="Skip the Telegram failure notification")
     parser.add_argument(
         "--exclude-clients",
@@ -251,8 +251,8 @@ def main():
     print(f"Verifying {len(crm_list)} client(s) over {len(dates)} day(s)...\n")
 
     filename = (
-        None if args.no_export
-        else f"{args.crm.lower()}_weekly_verification_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        f"{args.crm.lower()}_weekly_verification_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        if args.export else None
     )
     all_results = []
 
