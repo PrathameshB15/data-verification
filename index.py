@@ -460,9 +460,19 @@ def get_blob_order_data(client_id, target_date):
         # Normalize TRANSACTION_ID: NaN and empty string are treated as the same
         combined["TRANSACTION_ID"] = combined["TRANSACTION_ID"].fillna("")
 
-        # Deduplicate based on unique key
-        dedup_cols = ["TRANSACTION_ID", "DATE_OF_SALE", "ORDER_ID", "PRODUCT_ID", "CLIENT_ID"]
-        deduped = combined.drop_duplicates(subset=dedup_cols)
+        # Dedup at line-item grain: (order_id, product_id, date_of_sale, client_id).
+        # We deliberately exclude TRANSACTION_ID from the key — Sticky's raw_updated
+        # captures the same line item a second time once the transaction completes
+        # and the empty-txn snapshot is soft-closed in DB by close_stale_null_tx_rows
+        # (sticky/processed_updated_to_db.py). Counting both blob snapshots inflates
+        # the comparison vs DB. Prefer the row with a filled TRANSACTION_ID when both exist.
+        combined = combined.assign(
+            _txn_priority=combined["TRANSACTION_ID"].astype(str).map(
+                lambda s: 0 if s.strip() in ("", "0", "nan", "None") else 1
+            )
+        ).sort_values("_txn_priority", kind="stable")
+        dedup_cols = ["ORDER_ID", "PRODUCT_ID", "DATE_OF_SALE", "CLIENT_ID"]
+        deduped = combined.drop_duplicates(subset=dedup_cols, keep="last").drop(columns=["_txn_priority"])
         total_count = len(deduped)
         print(f"Deduplicated rows: {total_count}")
 
@@ -474,7 +484,10 @@ def get_blob_order_data(client_id, target_date):
         print(f"Test orders: {test_count}")
         print(f"Non-test orders: {non_test_count}")
 
-        return total_count, non_test_count, test_count, deduped
+        # 4th return is the non-test subset (used by verify_data Step 4 to
+        # match blob line items to DB rows by order_id, since Sticky shifts
+        # date_of_sale on later raw_updated re-fetches).
+        return total_count, non_test_count, test_count, deduped[~test_mask]
 
     except Exception as e:
         print(f"Error fetching blob data: {e}")
@@ -524,6 +537,26 @@ def _db_count(sql, params):
                 conn.close()
         except Exception:
             pass
+
+
+def get_db_order_count_by_ids(client_id, order_ids):
+    """Count active rows in data.orders_{client_id} whose order_id is in `order_ids`,
+    regardless of date_of_sale. Used by Sticky verification Step 4 because Sticky's
+    raw_updated pipeline can shift date_of_sale on later re-fetches, so a strict
+    date match misses rows that are still present (just under the next day's date)."""
+    if not order_ids:
+        return 0
+    ids = sorted({str(o) for o in order_ids if o is not None and str(o).strip() not in ("", "nan", "None")})
+    if not ids:
+        return 0
+    return _db_count(
+        f"""
+        SELECT COUNT(1) FROM data.orders_{client_id}
+        WHERE order_id::text = ANY(%s)
+          AND end_date = '9999-12-31'
+        """,
+        (ids,),
+    )
 
 
 def get_konnektive_db_count(client_id, date_str):
@@ -761,7 +794,7 @@ def verify_data(crm, target_date=None, dry_run=False):
 
     # Step 2: Get Blob order count (deduplicated)
     print(f"\n--- Step 2: Azure Blob Order Count ---")
-    blob_total, blob_non_test, blob_test, _ = get_blob_order_data(crm.CLIENT_ID, target_date)
+    blob_total, blob_non_test, blob_test, blob_non_test_df = get_blob_order_data(crm.CLIENT_ID, target_date)
     if blob_total is None:
         print("FAILED: Could not fetch blob data")
         if not dry_run:
@@ -803,9 +836,16 @@ def verify_data(crm, target_date=None, dry_run=False):
             "is_verified": False,
         }
 
-    # Step 4: Compare Blob non-test count with DB count
+    # Step 4: Compare Blob non-test count with DB count.
+    # Match by order_id set (not date_of_sale) so rows whose date_of_sale was
+    # shifted by a later raw_updated re-fetch still match.
     print(f"\n--- Step 4: Blob (non-test) vs DB Comparison ---")
-    db_count = get_db_order_count(crm.CLIENT_ID, date_str)
+    blob_order_ids = (
+        blob_non_test_df["ORDER_ID"].astype(str).tolist()
+        if blob_non_test_df is not None and "ORDER_ID" in blob_non_test_df.columns
+        else []
+    )
+    db_count = get_db_order_count_by_ids(crm.CLIENT_ID, blob_order_ids)
     if db_count is None:
         print("FAILED: Could not fetch database order count")
         if not dry_run:
