@@ -33,6 +33,10 @@ BLOB_CONTAINER_URL = (
     config.get("azure", "BLOB_CONTAINER_URL", fallback="").strip()
     if config.has_section("azure") else ""
 )
+AZURE_PROCESSED_UPDATED_SAS_URL = (
+    config.get("azure", "AZURE_PROCESSED_UPDATED_SAS_URL", fallback="").strip()
+    if config.has_section("azure") else ""
+)
 
 API_BLOB_THRESHOLD = 0.99  # 99% match between API and Blob
 BLOB_DB_THRESHOLD = 0.99   # 99% match between Blob (non-test) and DB
@@ -414,70 +418,137 @@ def get_crm_order_count(crm, date_str):
     return None, []
 
 
+def _read_blobs_to_df(container_client, prefix):
+    """List + read every parquet under a prefix into one DataFrame.
+    Returns (n_files, df) — df is None when no files were found."""
+    blobs = list(container_client.list_blobs(name_starts_with=prefix))
+    if not blobs:
+        return 0, None
+    dfs = []
+    for blob in blobs:
+        data = container_client.get_blob_client(blob.name).download_blob().readall()
+        dfs.append(pd.read_parquet(pd.io.common.BytesIO(data)))
+    return len(blobs), (pd.concat(dfs, ignore_index=True) if dfs else None)
+
+
+def _read_processedupdated_for_date_of_sale(container_client, client_id, target_date):
+    """Walk processedupdated/sticky/{client_id}/{Y}/{M}/{D}/ for every day from
+    target_date through today (NY-ish, just system today), filter to rows whose
+    DATE_OF_SALE matches target_date. Sticky can emit an updated snapshot for an
+    order days after the original sale, so historic verification has to look
+    forward from the target date."""
+    today = datetime.now().date()
+    cursor = target_date.date() if hasattr(target_date, "date") else target_date
+    target_date_str = target_date.strftime("%Y-%m-%d")
+    parts = []
+    total_files = 0
+    while cursor <= today:
+        prefix = f"sticky/{client_id}/{cursor.strftime('%Y/%m/%d')}/"
+        n_files, df = _read_blobs_to_df(container_client, prefix)
+        total_files += n_files
+        if df is not None and "DATE_OF_SALE" in df.columns:
+            df = df[df["DATE_OF_SALE"].astype(str) == target_date_str]
+            if not df.empty:
+                parts.append(df)
+        cursor += timedelta(days=1)
+    return total_files, (pd.concat(parts, ignore_index=True) if parts else None)
+
+
 def get_blob_order_data(client_id, target_date):
     """
-    Fetch and deduplicate order data from Azure Blob parquet files.
-    Path: processed/sticky/{client_id}/{year}/{month}/{day}/*.parquet
-    Deduplication key: (transaction_id, date_of_sale, order_id, product_id, client_id)
-    Returns: (total_deduplicated_count, non_test_count, test_count, DataFrame)
-    """
-    year = target_date.strftime("%Y")
-    month = target_date.strftime("%m")
-    day = target_date.strftime("%d")
-    prefix = f"sticky/{client_id}/{year}/{month}/{day}/"
+    Merge initial + updated processed blobs and dedupe to unique orders.
 
+    Sources:
+      - processed/sticky/{client_id}/{Y}/{M}/{D}/*.parquet           (initial drop)
+      - processedupdated/sticky/{client_id}/{Y}/{M}/{D}/*.parquet    (later updates,
+        scanned from target_date through today since Sticky can emit an updated
+        snapshot for an order days/weeks after the original sale)
+
+    Dedup rule (matches Sticky's live order_find result for the date):
+      - One row per ORDER_ID.
+      - When an order_id appears multiple times across both blobs, the row
+        with a real TRANSACTION_ID wins over a placeholder
+        ('', '0', 'nan', 'None', NaN). Retry pairs (same order, different
+        real TXNs) collapse to a single row — matches API behavior.
+
+    Returns: (total_unique_orders, non_test_count, test_count, non_test_DataFrame)
+    """
     if not BLOB_CONTAINER_URL:
         print("Error: [azure] BLOB_CONTAINER_URL is not set in config.ini — required for Sticky verification")
         return None, None, None, None
 
-    try:
-        container_client = ContainerClient.from_container_url(BLOB_CONTAINER_URL)
+    target_date_str = target_date.strftime("%Y-%m-%d")
+    init_prefix = f"sticky/{client_id}/{target_date.strftime('%Y/%m/%d')}/"
 
-        # List all parquet files for the day
-        blobs = list(container_client.list_blobs(name_starts_with=prefix))
-        if not blobs:
-            print(f"No blob files found at: {prefix}")
+    try:
+        proc_container = ContainerClient.from_container_url(BLOB_CONTAINER_URL)
+        n_init_files, init_df = _read_blobs_to_df(proc_container, init_prefix)
+        if n_init_files:
+            print(f"Found {n_init_files} initial parquet file(s) at: {init_prefix}")
+        else:
+            print(f"No initial blob files found at: {init_prefix}")
+
+        n_upd_files = 0
+        upd_df = None
+        if AZURE_PROCESSED_UPDATED_SAS_URL:
+            upd_container = ContainerClient.from_container_url(AZURE_PROCESSED_UPDATED_SAS_URL)
+            n_upd_files, upd_df = _read_processedupdated_for_date_of_sale(
+                upd_container, client_id, target_date
+            )
+            print(f"Scanned processedupdated: {n_upd_files} file(s) "
+                  f"across {target_date_str} → today, "
+                  f"{0 if upd_df is None else len(upd_df)} row(s) for DATE_OF_SALE={target_date_str}")
+        else:
+            print("Skipping processedupdated: [azure] AZURE_PROCESSED_UPDATED_SAS_URL not set in config.ini")
+
+        # Filter initial drop to target_date (older snapshots may carry shifted dates)
+        if init_df is not None and "DATE_OF_SALE" in init_df.columns:
+            init_df = init_df[init_df["DATE_OF_SALE"].astype(str) == target_date_str].copy()
+
+        # If both sides are empty, we have nothing
+        if (init_df is None or init_df.empty) and (upd_df is None or upd_df.empty):
             return None, None, None, None
 
-        print(f"Found {len(blobs)} parquet file(s) at: {prefix}")
+        # Tag source so processedupdated can win in the dedup
+        if init_df is not None and not init_df.empty:
+            init_df = init_df.copy()
+            init_df["_source"] = "initial"
+        else:
+            init_df = None
+        if upd_df is not None and not upd_df.empty:
+            upd_df = upd_df.copy()
+            upd_df["_source"] = "updated"
+        else:
+            upd_df = None
 
-        # Read and concatenate all parquet files
-        dfs = []
-        for blob in blobs:
-            blob_client = container_client.get_blob_client(blob.name)
-            data = blob_client.download_blob().readall()
-            df = pd.read_parquet(pd.io.common.BytesIO(data))
-            dfs.append(df)
-
-        combined = pd.concat(dfs, ignore_index=True)
-        print(f"Total rows across all files: {len(combined)}")
-
-        # Filter to only the target date
-        target_date_str = target_date.strftime("%Y-%m-%d")
-        combined = combined[combined["DATE_OF_SALE"].astype(str) == target_date_str]
-        print(f"Rows for {target_date_str}: {len(combined)}")
+        combined = pd.concat(
+            [d for d in (init_df, upd_df) if d is not None],
+            ignore_index=True,
+        )
+        print(f"Total rows after merging both blobs (DATE_OF_SALE={target_date_str}): {len(combined)}")
 
         # Normalize TRANSACTION_ID: NaN and empty string are treated as the same
         combined["TRANSACTION_ID"] = combined["TRANSACTION_ID"].fillna("")
 
-        # Dedup at line-item grain: (order_id, product_id, date_of_sale, client_id).
-        # We deliberately exclude TRANSACTION_ID from the key — Sticky's raw_updated
-        # captures the same line item a second time once the transaction completes
-        # and the empty-txn snapshot is soft-closed in DB by close_stale_null_tx_rows
-        # (sticky/processed_updated_to_db.py). Counting both blob snapshots inflates
-        # the comparison vs DB. Prefer the row with a filled TRANSACTION_ID when both exist.
+        # Sort so the winning row lands last in each ORDER_ID group (keep='last'):
+        # row with a real TRANSACTION_ID beats a placeholder. Retry pairs (same
+        # order_id, two different real TXNs) collapse to a single row — matches
+        # Sticky's order_find which returns each order_id once.
         combined = combined.assign(
             _txn_priority=combined["TRANSACTION_ID"].astype(str).map(
-                lambda s: 0 if s.strip() in ("", "0", "nan", "None") else 1
-            )
+                lambda s: 0 if s.strip().lower() in ("", "0", "nan", "none") else 1
+            ),
         ).sort_values("_txn_priority", kind="stable")
-        dedup_cols = ["ORDER_ID", "PRODUCT_ID", "DATE_OF_SALE", "CLIENT_ID"]
-        deduped = combined.drop_duplicates(subset=dedup_cols, keep="last").drop(columns=["_txn_priority"])
+
+        deduped = combined.drop_duplicates(subset=["ORDER_ID"], keep="last").drop(
+            columns=["_txn_priority", "_source"]
+        )
         total_count = len(deduped)
-        print(f"Deduplicated rows: {total_count}")
+        print(f"Unique orders (one per ORDER_ID, real-TXN preferred): {total_count}")
 
         # Identify test orders: IS_TEST == "True" or BILL_EMAIL contains 'test'
-        test_mask = deduped["IS_TEST"].astype(str).str.lower().eq("true") | deduped["BILL_EMAIL"].str.contains("test", case=False, na=False)
+        test_mask = deduped["IS_TEST"].astype(str).str.lower().eq("true") | \
+                    deduped["BILL_EMAIL"].astype(str).str.contains("test", case=False, na=False)
         test_count = int(test_mask.sum())
         non_test_count = int(total_count - test_count)
 
