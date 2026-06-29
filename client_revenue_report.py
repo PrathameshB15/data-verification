@@ -41,7 +41,11 @@ AIRTABLE_BASE_ID = config.get("airtable", "AIRTABLE_BASE_ID")
 AIRTABLE_TABLE_ID = config.get("airtable", "AIRTABLE_TABLE_ID")
 AIRTABLE_VIEW_ID = config.get("airtable", "AIRTABLE_VIEW_ID")
 
-TELEGRAM_BOT_TOKEN = config.get("telegram", "BOT_TOKEN")
+# The API URL already prepends "bot"; strip a stray "bot" prefix if the
+# configured token includes one, to avoid a "botbot..." 404.
+TELEGRAM_BOT_TOKEN = config.get("telegram", "BOT_TOKEN").strip()
+if TELEGRAM_BOT_TOKEN.startswith("bot"):
+    TELEGRAM_BOT_TOKEN = TELEGRAM_BOT_TOKEN[len("bot"):]
 TELEGRAM_CHAT_ID = config.get("telegram", "CHAT_ID")
 
 CLICKHOUSE_HOST = config.get("clickhouse", "CLICKHOUSE_HOST")
