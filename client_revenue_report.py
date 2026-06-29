@@ -104,18 +104,40 @@ def get_subscription_url(subscription_id):
     return f"https://dashboard.stripe.com/subscriptions/{subscription_id}"
 
 
-def get_price_tier(revenue):
-    """Calculate price tier based on last 30 days revenue."""
-    if revenue <= 10000:
-        return 99
-    elif revenue <= 50000:
-        return 499
-    elif revenue <= 500000:
-        return 1299
-    elif revenue <= 3000000:
-        return 2499
-    else:  # $3M to $8M+
-        return 3999
+# Revenue -> tier bands: first band whose upper bound (inclusive) is >= revenue
+# wins; None is the unbounded top band. Ordered ascending.
+DEFAULT_TIER_BANDS = [
+    (10000, 99),
+    (50000, 499),
+    (500000, 1299),
+    (3000000, 2499),
+    (None, 3999),  # $3M to $8M+
+]
+
+# Per-client overrides of the tier bands (keyed by client_id).
+CLIENT_TIER_BANDS = {
+    # Sabre Brands (10039): the $1299 -> $2499 boundary is $1M instead of $500k.
+    10039: [
+        (10000, 99),
+        (50000, 499),
+        (1000000, 1299),
+        (3000000, 2499),
+        (None, 3999),
+    ],
+}
+
+
+def get_price_tier(revenue, client_id=None):
+    """Calculate price tier based on last 30 days revenue.
+
+    Uses the client's custom tier bands when one is configured in
+    CLIENT_TIER_BANDS, otherwise the default bands.
+    """
+    bands = CLIENT_TIER_BANDS.get(client_id, DEFAULT_TIER_BANDS)
+    for upper, tier in bands:
+        if upper is None or revenue <= upper:
+            return tier
+    return bands[-1][1]
 
 
 # Recurring monthly Stripe Price IDs for each revenue tier (Beast Advanced product).
@@ -279,7 +301,7 @@ def update_airtable_revenue(report_data, table, records):
     for data in report_data:
         client_id = data["client_id"]
         revenue = data["last_30_days_revenue"]
-        price_tier = get_price_tier(revenue)
+        price_tier = get_price_tier(revenue, client_id)
 
         if client_id in client_to_record:
             record_id = client_to_record[client_id]
@@ -362,7 +384,7 @@ def check_upcoming_payments_and_notify(report_data, records):
     message = "<b>⚠️ Payment Due in 3 Days - New Pricing Model Clients</b>\n\n"
     for client in clients_due:
         current_tier = new_pricing_clients.get(client["client_id"])
-        updated_tier = get_price_tier(client["last_30_days_revenue"])
+        updated_tier = get_price_tier(client["last_30_days_revenue"], client["client_id"])
         message += (
             f"<b>{client['client_name']}</b> (ID: {client['client_id']})\n"
             f"  Next Payment: {client['next_payment_date']}\n"
@@ -443,7 +465,7 @@ def process_tier_changes(report_data, records, dry_run=False, days_ahead=3):
         clients_in_window += 1
 
         revenue = data["last_30_days_revenue"]
-        new_tier = get_price_tier(revenue)
+        new_tier = get_price_tier(revenue, client_id)
 
         current_price = data.get("current_price")
         item_id = data.get("subscription_item_id")
