@@ -128,6 +128,14 @@ CLIENT_TIER_BANDS = {
         (3000000, 2499),
         (None, 3999),
     ],
+    # Client 30000: the $499 -> $1299 boundary is $100k instead of $50k.
+    30000: [
+        (10000, 99),
+        (100000, 499),
+        (500000, 1299),
+        (3000000, 2499),
+        (None, 3999),
+    ],
 }
 
 
@@ -255,6 +263,7 @@ def get_revenue(client_id, start_date, end_date):
         """
         text = clickhouse_query(sql).strip()
         return float(text) if text else 0.0
+        
     except Exception as e:
         logger.error(f"Error fetching revenue for {client_id}: {e}")
         return None
@@ -402,28 +411,44 @@ def check_upcoming_payments_and_notify(report_data, records):
     logger.info(f"Notified about {len(clients_due)} client(s) with payments due in 3 days")
 
 
-def notify_tier_changes(changes, dry_run):
-    """Send a Telegram summary of the detected tier changes."""
+def notify_tier_changes(changes, skipped_dunning, dry_run):
+    """Send a Telegram summary of the detected tier changes and dunning skips."""
     header = "🧪 [DRY RUN] " if dry_run else ""
     message = f"<b>{header}📊 Tier Changes - New Pricing Model</b>\n\n"
-    for change in changes:
-        direction = "🔺 Upgrade" if change["new_tier"] > change["current_tier"] else "🔻 Downgrade"
-        if change["dry_run"]:
-            stripe_status = "DRY RUN — not applied"
-        elif change["applied"]:
-            stripe_status = "✅ updated (effective next renewal)"
-        else:
-            stripe_status = f"⚠️ FAILED: {change['error']}"
-        message += (
-            f"<b>{change['client_name']}</b> (ID: {change['client_id']})\n"
-            f"  {direction}: ${change['current_tier']} → ${change['new_tier']}\n"
-            f"  Last 30 Days Revenue: ${change['revenue']:,.2f}\n"
-            f"  Next Payment: {change['next_payment_date']}\n"
-            f"  Stripe: {stripe_status}\n"
-            f"  {change['subscription_url']}\n\n"
-        )
+
+    if changes:
+        for change in changes:
+            direction = "🔺 Upgrade" if change["new_tier"] > change["current_tier"] else "🔻 Downgrade"
+            if change["dry_run"]:
+                stripe_status = "DRY RUN — not applied"
+            elif change["applied"]:
+                stripe_status = "✅ updated (effective next renewal)"
+            else:
+                stripe_status = f"⚠️ FAILED: {change['error']}"
+            message += (
+                f"<b>{change['client_name']}</b> (ID: {change['client_id']})\n"
+                f"  {direction}: ${change['current_tier']} → ${change['new_tier']}\n"
+                f"  Last 30 Days Revenue: ${change['revenue']:,.2f}\n"
+                f"  Next Payment: {change['next_payment_date']}\n"
+                f"  Stripe: {stripe_status}\n"
+                f"  {change['subscription_url']}\n\n"
+            )
+    else:
+        message += "No tier changes needed.\n\n"
+
+    if skipped_dunning:
+        message += "<b>⏸ Skipped — payment retrying / past due:</b>\n"
+        for client in skipped_dunning:
+            message += (
+                f"<b>{client['client_name']}</b> (ID: {client['client_id']}) — status: {client['status']}\n"
+                f"  Next Payment: {client['next_payment_date']}\n"
+                f"  {client['subscription_url']}\n\n"
+            )
+
     send_telegram_message(message)
-    logger.info(f"Notified about {len(changes)} tier change(s)")
+    logger.info(
+        f"Notified about {len(changes)} tier change(s), {len(skipped_dunning)} dunning skip(s)"
+    )
 
 
 def process_tier_changes(report_data, records, dry_run=False, days_ahead=3):
@@ -448,6 +473,7 @@ def process_tier_changes(report_data, records, dry_run=False, days_ahead=3):
     window_end = today + timedelta(days=days_ahead)
 
     changes = []
+    skipped_dunning = []
     clients_in_window = 0
     for data in report_data:
         client_id = data["client_id"]
@@ -467,6 +493,21 @@ def process_tier_changes(report_data, records, dry_run=False, days_ahead=3):
             continue
 
         clients_in_window += 1
+
+        # Skip subscriptions in dunning (e.g. past_due/unpaid): a tier change
+        # can't re-price an open/retrying invoice and we don't want to alter a
+        # struggling account. It will be re-evaluated once it is active again.
+        status = data.get("status")
+        if status != "active":
+            logger.info(f"Client {client_id}: subscription status '{status}', skipping tier change (dunning)")
+            skipped_dunning.append({
+                "client_id": client_id,
+                "client_name": data["client_name"],
+                "status": status,
+                "next_payment_date": next_payment,
+                "subscription_url": data["subscription_url"],
+            })
+            continue
 
         revenue = data["last_30_days_revenue"]
         new_tier = get_price_tier(revenue, client_id)
@@ -520,8 +561,8 @@ def process_tier_changes(report_data, records, dry_run=False, days_ahead=3):
             "error": error,
         })
 
-    if changes:
-        notify_tier_changes(changes, dry_run)
+    if changes or skipped_dunning:
+        notify_tier_changes(changes, skipped_dunning, dry_run)
     elif clients_in_window == 0:
         logger.info(f"No New Pricing model clients with payments due in the next {days_ahead} days")
         header = "🧪 [DRY RUN] " if dry_run else ""
@@ -630,6 +671,7 @@ def generate_revenue_report(max_workers=10, dry_run=False):
             "last_30_days_revenue": revenue_30_days or 0.0,
             "current_price": stripe_data["current_price"],
             "subscription_item_id": stripe_data["subscription_item_id"],
+            "status": stripe_data["status"],
         })
 
         logger.info(f"Client {client_id} ({client_name}): ${revenue_30_days or 0:,.2f}")
