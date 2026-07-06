@@ -359,58 +359,6 @@ def send_telegram_message(message):
         logger.error(f"Error sending Telegram notification: {e}")
 
 
-def check_upcoming_payments_and_notify(report_data, records):
-    """
-    Check for clients with payments due in 3 days that have
-    'New Pricing Model' checked in Airtable, and send Telegram notifications.
-    """
-
-    # Build set of client IDs with "New Pricing model" checked and their current price tier
-    new_pricing_clients = {}
-    for record in records:
-        client_id = record["fields"].get("Client ID")
-        new_pricing = record["fields"].get("New Pricing model", False)
-        if client_id and new_pricing:
-            current_tier = record["fields"].get("Price Tier")
-            new_pricing_clients[int(client_id)] = current_tier
-
-    # Find clients with payment due in 3 days
-    target_date = (datetime.now().date() + timedelta(days=3)).strftime("%Y-%m-%d")
-    clients_due = []
-
-    for data in report_data:
-        client_id = data["client_id"]
-        next_payment = data["next_payment_date"]
-
-        if (
-            next_payment != "N/A"
-            and next_payment == target_date
-            and client_id in new_pricing_clients
-        ):
-            clients_due.append(data)
-
-    if not clients_due:
-        logger.info("No clients with upcoming payments in 3 days under New Pricing Model")
-        return
-
-    # Build and send Telegram message
-    message = "<b>⚠️ Payment Due in 3 Days - New Pricing Model Clients</b>\n\n"
-    for client in clients_due:
-        current_tier = new_pricing_clients.get(client["client_id"])
-        updated_tier = get_price_tier(client["last_30_days_revenue"], client["client_id"])
-        message += (
-            f"<b>{client['client_name']}</b> (ID: {client['client_id']})\n"
-            f"  Next Payment: {client['next_payment_date']}\n"
-            f"  Last 30 Days Revenue: ${client['last_30_days_revenue']:,.2f}\n"
-            f"  Current Price Tier: ${current_tier}\n"
-            f"  Updated Price Tier: ${updated_tier}\n"
-            f"  Subscription: {client['subscription_url']}\n\n"
-        )
-
-    send_telegram_message(message)
-    logger.info(f"Notified about {len(clients_due)} client(s) with payments due in 3 days")
-
-
 def notify_tier_changes(changes, skipped_dunning, dry_run):
     """Send a Telegram summary of the detected tier changes and dunning skips."""
     header = "🧪 [DRY RUN] " if dry_run else ""
@@ -734,10 +682,6 @@ def generate_revenue_report(max_workers=10, dry_run=False):
         logger.info("=" * 70)
         logger.info(f"Airtable updated: {updated_count} records")
         logger.info("=" * 70)
-
-        # Check for upcoming payments and send Telegram notifications
-        logger.info("Checking for upcoming payments (due in 3 days)...")
-        check_upcoming_payments_and_notify(report_data, airtable_records)
 
         # Detect tier changes for New Pricing model clients, update Stripe and notify
         logger.info("=" * 70)
