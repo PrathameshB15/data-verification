@@ -40,6 +40,21 @@ AZURE_PROCESSED_UPDATED_SAS_URL = (
 
 API_BLOB_THRESHOLD = 0.99  # 99% match between API and Blob
 BLOB_DB_THRESHOLD = 0.99   # 99% match between Blob (non-test) and DB
+CH_SYNC_THRESHOLD = 0.99   # 99% match between Postgres data.orders and ClickHouse data.orders
+CH_ENRICHED_THRESHOLD = 0.99  # 99% match between ClickHouse data.orders and orders_enriched
+
+CLICKHOUSE_HOST = (
+    config.get("clickhouse", "CLICKHOUSE_HOST", fallback="").strip()
+    if config.has_section("clickhouse") else ""
+)
+CLICKHOUSE_USER = (
+    config.get("clickhouse", "CLICKHOUSE_USER", fallback="").strip()
+    if config.has_section("clickhouse") else ""
+)
+CLICKHOUSE_PASSWORD = (
+    config.get("clickhouse", "CLICKHOUSE_PASSWORD", fallback="").strip()
+    if config.has_section("clickhouse") else ""
+)
 
 
 def get_crm_credentials(crm_name, client_id=None):
@@ -687,6 +702,122 @@ def get_paysight_orders_db_count(client_id, date_str):
     )
 
 
+def get_pg_orders_nontest_count(client_id, date_str):
+    """Count of active, non-test rows in Postgres data.orders_{client_id} for the date.
+    Excludes test orders (is_test IS NOT TRUE) so it matches the orders_enriched grain,
+    which only contains non-test orders."""
+    return _db_count(
+        f"""
+        SELECT COUNT(1) FROM data.orders_{client_id}
+        WHERE date_of_sale = %s
+          AND end_date = '9999-12-31'
+          AND is_test IS NOT TRUE
+        """,
+        (datetime.strptime(date_str, "%m/%d/%Y").strftime("%Y-%m-%d"),),
+    )
+
+
+def _ch_scalar(sql):
+    """Run a single-value query against the ClickHouse HTTP interface.
+    Returns the integer result, or None on any error (missing table, network, etc.)."""
+    if not CLICKHOUSE_HOST:
+        print("Error: [clickhouse] CLICKHOUSE_HOST is not set in config.ini — required for ClickHouse checks")
+        return None
+    headers = {
+        "X-ClickHouse-User": CLICKHOUSE_USER,
+        "X-ClickHouse-Key": CLICKHOUSE_PASSWORD,
+    }
+    try:
+        resp = requests.post(CLICKHOUSE_HOST, data=sql.encode(), headers=headers, timeout=60)
+        if resp.status_code != 200:
+            print(f"ClickHouse query failed ({resp.status_code}): {resp.text.strip()[:200]}")
+            return None
+        text = resp.text.strip()
+        return int(text) if text else 0
+    except Exception as e:
+        print(f"Error querying ClickHouse: {e}")
+        return None
+
+
+def get_ch_orders_count(client_id, date_str):
+    """Count of active, non-test rows in ClickHouse data.orders_{client_id} for the date.
+    Excludes test orders (is_test = 0) so it matches both the Postgres non-test count
+    (Step 5) and the orders_enriched grain, which only contains non-test orders (Step 6)."""
+    sql_date = datetime.strptime(date_str, "%m/%d/%Y").strftime("%Y-%m-%d")
+    return _ch_scalar(
+        f"SELECT COUNT(1) FROM data.orders_{client_id} "
+        f"WHERE date_of_sale = '{sql_date}' AND end_date = '9999-12-31' "
+        f"AND (is_test = 0 OR is_test IS NULL) FORMAT TabSeparated"
+    )
+
+
+def get_ch_enriched_count(client_id, date_str):
+    """Distinct non-test orders in ClickHouse reporting.orders_enriched_{client_id} for the date.
+    The enriched table fans out rows per order (alert/refund/cb/void/tc40 events), so we
+    restrict to the sale/order grain (kind='sale' AND row_kind='order'), exclude test orders,
+    and dedup by unique_order_key to reproduce the data.orders_ non-test grain."""
+    sql_date = datetime.strptime(date_str, "%m/%d/%Y").strftime("%Y-%m-%d")
+    return _ch_scalar(
+        f"SELECT uniqExact(unique_order_key) FROM reporting.orders_enriched_{client_id} "
+        f"WHERE kind = 'sale' AND row_kind = 'order' AND date_of_sale = '{sql_date}' "
+        f"AND (is_test = 0 OR is_test IS NULL) FORMAT TabSeparated"
+    )
+
+
+def _match_pct(a, b):
+    """Symmetric match percentage between two counts. None if either is missing."""
+    if a is None or b is None:
+        return None
+    if max(a, b) == 0:
+        return 100.0
+    return min(a, b) / max(a, b) * 100
+
+
+def run_clickhouse_checks(client_id, date_str):
+    """
+    Step 5: Postgres data.orders_{id}  vs  ClickHouse data.orders_{id}  (sync check)
+    Step 6: ClickHouse data.orders_{id}  vs  reporting.orders_enriched_{id}  (enrichment check)
+
+    All counts exclude test orders, since orders_enriched only contains non-test orders.
+    A missing table (None count) is treated as a failure. Returns a dict of counts,
+    percentages, and per-step pass flags plus an overall ch_pass.
+    """
+    pg_orders = get_pg_orders_nontest_count(client_id, date_str)
+    ch_orders = get_ch_orders_count(client_id, date_str)
+    enriched = get_ch_enriched_count(client_id, date_str)
+
+    sync_pct = _match_pct(pg_orders, ch_orders)
+    enriched_pct = _match_pct(ch_orders, enriched)
+
+    sync_pass = sync_pct is not None and sync_pct >= (CH_SYNC_THRESHOLD * 100)
+    enriched_pass = enriched_pct is not None and enriched_pct >= (CH_ENRICHED_THRESHOLD * 100)
+
+    print(f"\n--- Step 5: Postgres vs ClickHouse (data.orders sync) ---")
+    print(f"Postgres data.orders:    {pg_orders if pg_orders is not None else 'N/A (missing)'}")
+    print(f"ClickHouse data.orders:  {ch_orders if ch_orders is not None else 'N/A (missing)'}")
+    print(f"Match:                   {f'{sync_pct:.2f}%' if sync_pct is not None else 'N/A'}   "
+          f"Threshold: {CH_SYNC_THRESHOLD * 100}%")
+    print(f"Status:                  {'PASS' if sync_pass else 'FAIL'}")
+
+    print(f"\n--- Step 6: ClickHouse data.orders vs orders_enriched ---")
+    print(f"ClickHouse data.orders:  {ch_orders if ch_orders is not None else 'N/A (missing)'}")
+    print(f"orders_enriched (orders):{enriched if enriched is not None else 'N/A (missing)'}")
+    print(f"Match:                   {f'{enriched_pct:.2f}%' if enriched_pct is not None else 'N/A'}   "
+          f"Threshold: {CH_ENRICHED_THRESHOLD * 100}%")
+    print(f"Status:                  {'PASS' if enriched_pass else 'FAIL'}")
+
+    return {
+        "ch_pg_orders": pg_orders,
+        "ch_orders": ch_orders,
+        "ch_enriched": enriched,
+        "ch_sync_pct": round(sync_pct, 2) if sync_pct is not None else None,
+        "ch_enriched_pct": round(enriched_pct, 2) if enriched_pct is not None else None,
+        "ch_sync_pass": sync_pass,
+        "ch_enriched_pass": enriched_pass,
+        "ch_pass": sync_pass and enriched_pass,
+    }
+
+
 def update_data_verified_status(client_id, is_verified):
     """
     Update the data_verified column in beast_insights_v2.clients_pipeline_status table.
@@ -728,14 +859,14 @@ def update_data_verified_status(client_id, is_verified):
 PAYSIGHT_THRESHOLD = 0.90  # paysight.py passes at 90% on both sub-checks
 
 
-def _verify_paysight(crm, target_date, date_str, dry_run):
+def _verify_paysight(crm, target_date, date_str, dry_run, update_status=True):
     """Mirror paysight.py: dual API↔DB check (raw paysight table + filtered orders table)
     with 90% threshold; PASS only if both checks pass."""
     print(f"\n--- Paysight: fetching transactions for {target_date.strftime('%Y-%m-%d')} ---")
     crm_total, crm_orders = _paysight_counts(crm, date_str)
     if crm_total is None:
         print("FAILED: Could not fetch CRM transaction count")
-        if not dry_run:
+        if update_status and not dry_run:
             update_data_verified_status(crm.CLIENT_ID, False)
         return {"status": "ERROR", "client_id": crm.CLIENT_ID, "client_name": crm.CLIENT_NAME, "date": date_str, "error": "Failed to fetch CRM transaction count"}
 
@@ -745,7 +876,7 @@ def _verify_paysight(crm, target_date, date_str, dry_run):
     orders_count = get_paysight_orders_db_count(crm.CLIENT_ID, date_str)
     if paysight_count is None or orders_count is None:
         print("FAILED: Could not fetch database counts")
-        if not dry_run:
+        if update_status and not dry_run:
             update_data_verified_status(crm.CLIENT_ID, False)
         return {"status": "ERROR", "client_id": crm.CLIENT_ID, "client_name": crm.CLIENT_NAME, "date": date_str, "error": "Failed to fetch database counts"}
 
@@ -762,7 +893,7 @@ def _verify_paysight(crm, target_date, date_str, dry_run):
     print(f"  data.orders_{crm.CLIENT_ID}:   {orders_count}/{crm_orders} ({orders_pct:.2f}%)  {'PASS' if orders_pass else 'FAIL'}")
     print(f"  Threshold: {threshold_pct}%   Status: {status}")
 
-    if not dry_run:
+    if update_status and not dry_run:
         update_data_verified_status(crm.CLIENT_ID, bool(is_verified))
 
     # api_db_pct uses the orders comparison (the more meaningful one) so the existing column doesn't break
@@ -785,11 +916,14 @@ def _verify_paysight(crm, target_date, date_str, dry_run):
     }
 
 
-def verify_data(crm, target_date=None, dry_run=False):
+def _verify_core(crm, target_date=None, dry_run=False, update_status=True):
     """
-    Verify data through 3-step pipeline:
+    Verify data through the CRM-specific pipeline (API / Blob / DB).
     Step 1: API count vs Blob count (deduplicated)
     Step 2: Blob count (minus test orders) vs DB count
+
+    When update_status is False, this does not write data_verified — the caller
+    (verify_data) does so once, after the ClickHouse steps, using the combined result.
     """
     if target_date is None:
         target_date = datetime.now() - timedelta(days=1)
@@ -803,14 +937,14 @@ def verify_data(crm, target_date=None, dry_run=False):
 
     crm_name_early = (getattr(crm, "CRM_NAME", "") or "").strip().lower()
     if crm_name_early == "paysight":
-        return _verify_paysight(crm, target_date, date_str, dry_run)
+        return _verify_paysight(crm, target_date, date_str, dry_run, update_status)
 
     # Step 1: Get CRM API order count
     print(f"\n--- Step 1: CRM API Order Count ---")
     crm_count, _ = get_crm_order_count(crm, date_str)
     if crm_count is None:
         print("FAILED: Could not fetch CRM order count")
-        if not dry_run:
+        if update_status and not dry_run:
             update_data_verified_status(crm.CLIENT_ID, False)
         return {"status": "ERROR", "client_id": crm.CLIENT_ID, "client_name": crm.CLIENT_NAME, "date": date_str, "error": "Failed to fetch CRM order count"}
 
@@ -828,7 +962,7 @@ def verify_data(crm, target_date=None, dry_run=False):
             db_count = get_db_order_count(crm.CLIENT_ID, date_str)
         if db_count is None:
             print("FAILED: Could not fetch database order count")
-            if not dry_run:
+            if update_status and not dry_run:
                 update_data_verified_status(crm.CLIENT_ID, False)
             return {"status": "ERROR", "client_id": crm.CLIENT_ID, "client_name": crm.CLIENT_NAME, "date": date_str, "error": "Failed to fetch database order count"}
 
@@ -847,7 +981,7 @@ def verify_data(crm, target_date=None, dry_run=False):
 
         status = "PASS" if api_db_pass else "FAIL"
         print(f"\n{'='*60}\nVerification Status:     {status}\n{'='*60}\n")
-        if not dry_run:
+        if update_status and not dry_run:
             update_data_verified_status(crm.CLIENT_ID, bool(api_db_pass))
         return {
             "status": status,
@@ -868,7 +1002,7 @@ def verify_data(crm, target_date=None, dry_run=False):
     blob_total, blob_non_test, blob_test, blob_non_test_df = get_blob_order_data(crm.CLIENT_ID, target_date)
     if blob_total is None:
         print("FAILED: Could not fetch blob data")
-        if not dry_run:
+        if update_status and not dry_run:
             update_data_verified_status(crm.CLIENT_ID, False)
         return {"status": "ERROR", "client_id": crm.CLIENT_ID, "client_name": crm.CLIENT_NAME, "date": date_str, "error": "Failed to fetch blob data"}
 
@@ -893,7 +1027,7 @@ def verify_data(crm, target_date=None, dry_run=False):
         diff = crm_count - blob_total
         print(f"Missing in Blob:         {diff}")
         print("FAILED: Blob coverage below threshold")
-        if not dry_run:
+        if update_status and not dry_run:
             update_data_verified_status(crm.CLIENT_ID, False)
         return {
             "status": "FAIL",
@@ -919,7 +1053,7 @@ def verify_data(crm, target_date=None, dry_run=False):
     db_count = get_db_order_count_by_ids(crm.CLIENT_ID, blob_order_ids)
     if db_count is None:
         print("FAILED: Could not fetch database order count")
-        if not dry_run:
+        if update_status and not dry_run:
             update_data_verified_status(crm.CLIENT_ID, False)
         return {"status": "ERROR", "client_id": crm.CLIENT_ID, "client_name": crm.CLIENT_NAME, "date": date_str, "error": "Failed to fetch database order count"}
 
@@ -948,7 +1082,7 @@ def verify_data(crm, target_date=None, dry_run=False):
     print(f"Verification Status:     {status}")
     print(f"{'='*60}\n")
 
-    if not dry_run:
+    if update_status and not dry_run:
         update_data_verified_status(crm.CLIENT_ID, bool(is_verified))
 
     api_db_pct = (
@@ -969,6 +1103,53 @@ def verify_data(crm, target_date=None, dry_run=False):
         "api_db_pct": api_db_pct,
         "is_verified": is_verified,
     }
+
+
+def verify_data(crm, target_date=None, dry_run=False):
+    """
+    Full verification for one (client, date):
+      1-4. CRM-specific pipeline (API / Blob / DB)  — via _verify_core
+      5.   Postgres data.orders  vs  ClickHouse data.orders   (sync check)
+      6.   ClickHouse data.orders  vs  orders_enriched         (enrichment check)
+
+    The overall status is PASS only if the core pipeline AND both ClickHouse steps
+    pass. data_verified is written once here, based on the combined result.
+    """
+    if target_date is None:
+        target_date = datetime.now() - timedelta(days=1)
+    date_str = target_date.strftime("%m/%d/%Y")
+
+    # Core CRM pipeline — defer the data_verified write to us (after CH steps)
+    core = _verify_core(crm, target_date, dry_run=dry_run, update_status=False)
+
+    # If the core pipeline couldn't fetch its inputs, there's nothing to reconcile
+    # against ClickHouse — persist the failure and return.
+    if core.get("status") == "ERROR":
+        if not dry_run:
+            update_data_verified_status(crm.CLIENT_ID, False)
+        return core
+
+    core_pass = core.get("status") == "PASS"
+
+    # Steps 5 & 6: ClickHouse sync + enrichment reconciliation
+    ch = run_clickhouse_checks(crm.CLIENT_ID, date_str)
+
+    final_verified = core_pass and ch["ch_pass"]
+    status = "PASS" if final_verified else "FAIL"
+
+    print(f"\n{'='*60}")
+    print(f"Overall Verification (incl. ClickHouse):  {status}")
+    print(f"{'='*60}\n")
+
+    if not dry_run:
+        update_data_verified_status(crm.CLIENT_ID, bool(final_verified))
+
+    # Merge ClickHouse results in and override the headline status/flag
+    core.update(ch)
+    core["status"] = status
+    core["is_verified"] = final_verified
+    core["core_status"] = "PASS" if core_pass else "FAIL"
+    return core
 
 
 def main():
@@ -1095,6 +1276,11 @@ def main():
                     "DB Count": db_count,
                     "API→Blob %": round((blob_total / crm_count) * 100, 2) if isinstance(crm_count, int) and isinstance(blob_total, int) and crm_count > 0 else None,
                     "Blob→DB %": round(min(blob_non_test, db_count) / max(blob_non_test, db_count) * 100, 2) if isinstance(blob_non_test, int) and isinstance(db_count, int) and max(blob_non_test, db_count) > 0 else None,
+                    "PG Orders": r.get("ch_pg_orders"),
+                    "CH Orders": r.get("ch_orders"),
+                    "PG→CH %": r.get("ch_sync_pct"),
+                    "Enriched": r.get("ch_enriched"),
+                    "CH→Enriched %": r.get("ch_enriched_pct"),
                     "Status": r.get("status"),
                 })
             df = pd.DataFrame(excel_data)
@@ -1112,8 +1298,8 @@ def main():
 
     print(f"Clients: {len(crm_list)} | Days: {len(dates_to_verify)} | Total: {len(all_results)} | Passed: {passed} | Failed: {failed} | Errors: {errors}")
 
-    print(f"\n{'Client':<10} {'Name':<22} {'Date':<14} {'API':>8} {'Blob':>8} {'Test':>6} {'Non-Test':>10} {'DB':>8} {'API→Blob':>10} {'Blob→DB':>10} {'Status':<6}")
-    print("-" * 110)
+    print(f"\n{'Client':<10} {'Name':<22} {'Date':<14} {'API':>8} {'Blob':>8} {'Non-Test':>10} {'DB':>8} {'API→Blob':>10} {'Blob→DB':>10} {'PG.ord':>8} {'CH.ord':>8} {'PG→CH':>8} {'Enrich':>8} {'CH→Enr':>8} {'Status':<6}")
+    print("-" * 150)
     for r in all_results:
         client_id = r.get("client_id", "-")
         client_name = str(r.get("client_name", "-"))[:20]
@@ -1121,7 +1307,6 @@ def main():
         status = r.get("status", "N/A")
         crm_count = r.get("crm_count", "-")
         blob_total = r.get("blob_total", "-")
-        blob_test = r.get("blob_test", "-")
         blob_non_test = r.get("blob_non_test", "-")
         db_count = r.get("db_count", "-")
 
@@ -1135,9 +1320,20 @@ def main():
         else:
             blob_db_pct = "-"
 
-        print(f"{str(client_id):<10} {client_name:<22} {date:<14} {str(crm_count):>8} {str(blob_total):>8} {str(blob_test):>6} {str(blob_non_test):>10} {str(db_count):>8} {api_blob_pct:>10} {blob_db_pct:>10} {status:<6}")
+        pg_ord = r.get("ch_pg_orders")
+        ch_ord = r.get("ch_orders")
+        enriched = r.get("ch_enriched")
+        sync_pct = r.get("ch_sync_pct")
+        enr_pct = r.get("ch_enriched_pct")
+        pg_ord_s = str(pg_ord) if pg_ord is not None else "-"
+        ch_ord_s = str(ch_ord) if ch_ord is not None else "-"
+        enriched_s = str(enriched) if enriched is not None else "-"
+        sync_pct_s = f"{sync_pct:.1f}%" if isinstance(sync_pct, (int, float)) else "-"
+        enr_pct_s = f"{enr_pct:.1f}%" if isinstance(enr_pct, (int, float)) else "-"
 
-    print("=" * 110)
+        print(f"{str(client_id):<10} {client_name:<22} {date:<14} {str(crm_count):>8} {str(blob_total):>8} {str(blob_non_test):>10} {str(db_count):>8} {api_blob_pct:>10} {blob_db_pct:>10} {pg_ord_s:>8} {ch_ord_s:>8} {sync_pct_s:>8} {enriched_s:>8} {enr_pct_s:>8} {status:<6}")
+
+    print("=" * 150)
     if args.export:
         print(f"\nExcel report: {filename}")
 
