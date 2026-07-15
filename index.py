@@ -703,15 +703,17 @@ def get_paysight_orders_db_count(client_id, date_str):
 
 
 def get_pg_orders_nontest_count(client_id, date_str):
-    """Count of active, non-test rows in Postgres data.orders_{client_id} for the date.
-    Excludes test orders (is_test IS NOT TRUE) so it matches the orders_enriched grain,
-    which only contains non-test orders."""
+    """Count of active, non-test, non-excluded rows in Postgres data.orders_{client_id}
+    for the date. Excludes test orders (is_test IS NOT TRUE) and excluded orders
+    (is_exclude IS NOT TRUE) so it matches the orders_enriched grain, which only contains
+    non-test, non-excluded orders."""
     return _db_count(
         f"""
         SELECT COUNT(1) FROM data.orders_{client_id}
         WHERE date_of_sale = %s
           AND end_date = '9999-12-31'
           AND is_test IS NOT TRUE
+          AND is_exclude IS NOT TRUE
         """,
         (datetime.strptime(date_str, "%m/%d/%Y").strftime("%Y-%m-%d"),),
     )
@@ -740,27 +742,30 @@ def _ch_scalar(sql):
 
 
 def get_ch_orders_count(client_id, date_str):
-    """Count of active, non-test rows in ClickHouse data.orders_{client_id} for the date.
-    Excludes test orders (is_test = 0) so it matches both the Postgres non-test count
-    (Step 5) and the orders_enriched grain, which only contains non-test orders (Step 6)."""
+    """Count of active, non-test, non-excluded rows in ClickHouse data.orders_{client_id}
+    for the date. Excludes test orders (is_test = 0) and excluded orders (is_exclude = 0)
+    so it matches both the Postgres non-test count (Step 5) and the orders_enriched grain,
+    which only contains non-test, non-excluded orders (Step 6)."""
     sql_date = datetime.strptime(date_str, "%m/%d/%Y").strftime("%Y-%m-%d")
     return _ch_scalar(
         f"SELECT COUNT(1) FROM data.orders_{client_id} "
         f"WHERE date_of_sale = '{sql_date}' AND end_date = '9999-12-31' "
-        f"AND (is_test = 0 OR is_test IS NULL) FORMAT TabSeparated"
+        f"AND (is_test = 0 OR is_test IS NULL) "
+        f"AND (is_exclude = 0 OR is_exclude IS NULL) FORMAT TabSeparated"
     )
 
 
 def get_ch_enriched_count(client_id, date_str):
-    """Distinct non-test orders in ClickHouse reporting.orders_enriched_{client_id} for the date.
-    The enriched table fans out rows per order (alert/refund/cb/void/tc40 events), so we
-    restrict to the sale/order grain (kind='sale' AND row_kind='order'), exclude test orders,
-    and dedup by unique_order_key to reproduce the data.orders_ non-test grain."""
+    """Distinct non-test, non-excluded orders in ClickHouse reporting.orders_enriched_{client_id}
+    for the date. The enriched table fans out rows per order (alert/refund/cb/void/tc40 events),
+    so we restrict to the sale/order grain (kind='sale' AND row_kind='order'), exclude test and
+    excluded orders, and dedup by unique_order_key to reproduce the data.orders_ grain."""
     sql_date = datetime.strptime(date_str, "%m/%d/%Y").strftime("%Y-%m-%d")
     return _ch_scalar(
         f"SELECT uniqExact(unique_order_key) FROM reporting.orders_enriched_{client_id} "
         f"WHERE kind = 'sale' AND row_kind = 'order' AND date_of_sale = '{sql_date}' "
-        f"AND (is_test = 0 OR is_test IS NULL) FORMAT TabSeparated"
+        f"AND (is_test = 0 OR is_test IS NULL) "
+        f"AND (is_exclude = 0 OR is_exclude IS NULL) FORMAT TabSeparated"
     )
 
 
