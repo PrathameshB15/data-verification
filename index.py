@@ -758,13 +758,16 @@ def get_ch_orders_count(client_id, date_str):
 
 
 def get_ch_enriched_count(client_id, date_str):
-    """Distinct non-test, non-excluded orders in ClickHouse reporting.orders_enriched_{client_id}
-    for the date. The enriched table fans out rows per order (alert/refund/cb/void/tc40 events),
-    so we restrict to the sale/order grain (kind='sale' AND row_kind='order'), exclude test and
-    excluded orders, and dedup by unique_order_key to reproduce the data.orders_ grain."""
+    """Distinct non-test, non-excluded order_ids in ClickHouse reporting.orders_enriched_{client_id}
+    for the date. The enriched table fans out rows per order (alert/refund/cb/void/tc40 events and,
+    for some CRMs, multiple rows per order_id), so we restrict to the sale/order grain
+    (kind='sale' AND row_kind='order'), exclude test and excluded orders, and count distinct
+    order_id to match the data.orders_ distinct-order_id grain (get_ch_orders_count). Counting
+    order_id rather than unique_order_key keeps both sides on the same grain for CRMs where an
+    order_id legitimately spans multiple enriched rows (e.g. Konnektive)."""
     sql_date = datetime.strptime(date_str, "%m/%d/%Y").strftime("%Y-%m-%d")
     return _ch_scalar(
-        f"SELECT uniqExact(unique_order_key) FROM reporting.orders_enriched_{client_id} "
+        f"SELECT uniqExact(order_id) FROM reporting.orders_enriched_{client_id} "
         f"WHERE kind = 'sale' AND row_kind = 'order' AND date_of_sale = '{sql_date}' "
         f"AND (is_test = 0 OR is_test IS NULL) "
         f"AND (is_exclude = 0 OR is_exclude IS NULL) FORMAT TabSeparated"
