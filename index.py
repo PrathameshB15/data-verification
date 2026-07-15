@@ -703,13 +703,14 @@ def get_paysight_orders_db_count(client_id, date_str):
 
 
 def get_pg_orders_nontest_count(client_id, date_str):
-    """Count of active, non-test, non-excluded rows in Postgres data.orders_{client_id}
-    for the date. Excludes test orders (is_test IS NOT TRUE) and excluded orders
-    (is_exclude IS NOT TRUE) so it matches the orders_enriched grain, which only contains
-    non-test, non-excluded orders."""
+    """Count of distinct active, non-test, non-excluded order_ids in Postgres
+    data.orders_{client_id} for the date. Uses COUNT(DISTINCT order_id) so duplicate
+    rows don't skew the Postgres-vs-ClickHouse comparison. Excludes test orders
+    (is_test IS NOT TRUE) and excluded orders (is_exclude IS NOT TRUE) to match the
+    orders_enriched grain, which only contains non-test, non-excluded orders."""
     return _db_count(
         f"""
-        SELECT COUNT(1) FROM data.orders_{client_id}
+        SELECT COUNT(DISTINCT order_id) FROM data.orders_{client_id}
         WHERE date_of_sale = %s
           AND end_date = '9999-12-31'
           AND is_test IS NOT TRUE
@@ -742,13 +743,14 @@ def _ch_scalar(sql):
 
 
 def get_ch_orders_count(client_id, date_str):
-    """Count of active, non-test, non-excluded rows in ClickHouse data.orders_{client_id}
-    for the date. Excludes test orders (is_test = 0) and excluded orders (is_exclude = 0)
-    so it matches both the Postgres non-test count (Step 5) and the orders_enriched grain,
-    which only contains non-test, non-excluded orders (Step 6)."""
+    """Count of distinct active, non-test, non-excluded order_ids in ClickHouse
+    data.orders_{client_id} for the date. Uses uniqExact(order_id) so duplicate rows
+    (e.g. un-merged ReplacingMergeTree parts) don't skew the comparison. Excludes test
+    orders (is_test = 0) and excluded orders (is_exclude = 0) so it matches both the
+    Postgres distinct count (Step 5) and the orders_enriched grain (Step 6)."""
     sql_date = datetime.strptime(date_str, "%m/%d/%Y").strftime("%Y-%m-%d")
     return _ch_scalar(
-        f"SELECT COUNT(1) FROM data.orders_{client_id} "
+        f"SELECT uniqExact(order_id) FROM data.orders_{client_id} "
         f"WHERE date_of_sale = '{sql_date}' AND end_date = '9999-12-31' "
         f"AND (is_test = 0 OR is_test IS NULL) "
         f"AND (is_exclude = 0 OR is_exclude IS NULL) FORMAT TabSeparated"
