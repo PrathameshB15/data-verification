@@ -38,10 +38,37 @@ AZURE_PROCESSED_UPDATED_SAS_URL = (
     if config.has_section("azure") else ""
 )
 
-API_BLOB_THRESHOLD = 0.99  # 99% match between API and Blob
-BLOB_DB_THRESHOLD = 0.99   # 99% match between Blob (non-test) and DB
-CH_SYNC_THRESHOLD = 0.99   # 99% match between Postgres data.orders and ClickHouse data.orders
-CH_ENRICHED_THRESHOLD = 0.99  # 99% match between ClickHouse data.orders and orders_enriched
+# Adaptive count-match tolerance (replaces the old flat 99% thresholds).
+# A flat percentage is unfair on low-order clients (1 missing order out of 24 is
+# noise, but trips a 99% rule). Instead, allow a number of mismatches that:
+#   - never drops below TOL_MIN_ABS (an absolute floor for small clients), and
+#   - grows with volume as TOL_RATE*ref + TOL_Z*sqrt(TOL_RATE*ref), whose *relative*
+#     size converges to ~TOL_RATE (1%) for large clients.
+TOL_RATE = 0.01      # P: per-order mismatch rate treated as normal noise
+TOL_Z = 1.65         # ~95% one-sided confidence cushion
+TOL_MIN_ABS = 5      # always allow at least this many mismatches (floor for everyone)
+
+
+def allowed_mismatches(reference):
+    """Max number of mismatched orders tolerated for a count of `reference`."""
+    ref = max(0, reference)
+    return max(TOL_MIN_ABS, TOL_RATE * ref + TOL_Z * (TOL_RATE * ref) ** 0.5)
+
+
+def count_match(reference, other, one_sided=False):
+    """Compare two counts with the adaptive tolerance.
+
+    reference: expected/source count — the tolerance band scales with this.
+    other:     the count being checked against it.
+    one_sided: when True, only a shortfall (other < reference) can fail; extras pass
+               (e.g. API vs Blob, where the blob may legitimately have more line items).
+
+    Returns (passed, diff, allowed, tol_pct).
+    """
+    diff = max(0, reference - other) if one_sided else abs(reference - other)
+    allowed = allowed_mismatches(reference)
+    tol_pct = (allowed / reference * 100) if reference > 0 else 100.0
+    return diff <= allowed, diff, allowed, tol_pct
 
 CLICKHOUSE_HOST = (
     config.get("clickhouse", "CLICKHOUSE_HOST", fallback="").strip()
@@ -796,24 +823,33 @@ def run_clickhouse_checks(client_id, date_str):
     ch_orders = get_ch_orders_count(client_id, date_str)
     enriched = get_ch_enriched_count(client_id, date_str)
 
+    # Symmetric adaptive tolerance (missing table -> None -> fail).
     sync_pct = _match_pct(pg_orders, ch_orders)
     enriched_pct = _match_pct(ch_orders, enriched)
 
-    sync_pass = sync_pct is not None and sync_pct >= (CH_SYNC_THRESHOLD * 100)
-    enriched_pass = enriched_pct is not None and enriched_pct >= (CH_ENRICHED_THRESHOLD * 100)
+    if pg_orders is None or ch_orders is None:
+        sync_pass, sync_diff, sync_allowed = False, None, None
+    else:
+        sync_pass, sync_diff, sync_allowed, _ = count_match(
+            max(pg_orders, ch_orders), min(pg_orders, ch_orders))
+    if ch_orders is None or enriched is None:
+        enriched_pass, enr_diff, enr_allowed = False, None, None
+    else:
+        enriched_pass, enr_diff, enr_allowed, _ = count_match(
+            max(ch_orders, enriched), min(ch_orders, enriched))
 
     print(f"\n--- Step 5: Postgres vs ClickHouse (data.orders sync) ---")
     print(f"Postgres data.orders:    {pg_orders if pg_orders is not None else 'N/A (missing)'}")
     print(f"ClickHouse data.orders:  {ch_orders if ch_orders is not None else 'N/A (missing)'}")
-    print(f"Match:                   {f'{sync_pct:.2f}%' if sync_pct is not None else 'N/A'}   "
-          f"Threshold: {CH_SYNC_THRESHOLD * 100}%")
+    print(f"Match:                   {f'{sync_pct:.2f}%' if sync_pct is not None else 'N/A'}"
+          + (f"   Diff: {sync_diff}  Allowed: {sync_allowed:.2f}" if sync_allowed is not None else ""))
     print(f"Status:                  {'PASS' if sync_pass else 'FAIL'}")
 
     print(f"\n--- Step 6: ClickHouse data.orders vs orders_enriched ---")
     print(f"ClickHouse data.orders:  {ch_orders if ch_orders is not None else 'N/A (missing)'}")
     print(f"orders_enriched (orders):{enriched if enriched is not None else 'N/A (missing)'}")
-    print(f"Match:                   {f'{enriched_pct:.2f}%' if enriched_pct is not None else 'N/A'}   "
-          f"Threshold: {CH_ENRICHED_THRESHOLD * 100}%")
+    print(f"Match:                   {f'{enriched_pct:.2f}%' if enriched_pct is not None else 'N/A'}"
+          + (f"   Diff: {enr_diff}  Allowed: {enr_allowed:.2f}" if enr_allowed is not None else ""))
     print(f"Status:                  {'PASS' if enriched_pass else 'FAIL'}")
 
     return {
@@ -976,18 +1012,13 @@ def _verify_core(crm, target_date=None, dry_run=False, update_status=True):
                 update_data_verified_status(crm.CLIENT_ID, False)
             return {"status": "ERROR", "client_id": crm.CLIENT_ID, "client_name": crm.CLIENT_NAME, "date": date_str, "error": "Failed to fetch database order count"}
 
-        if max(crm_count, db_count) > 0:
-            api_db_pct = min(crm_count, db_count) / max(crm_count, db_count) * 100
-        else:
-            api_db_pct = 100.0
-
-        api_db_pass = api_db_pct >= (BLOB_DB_THRESHOLD * 100)
+        ref = max(crm_count, db_count)
+        api_db_pct = (min(crm_count, db_count) / ref * 100) if ref > 0 else 100.0
+        api_db_pass, api_db_diff, api_db_allowed, api_db_tol = count_match(ref, min(crm_count, db_count))
         print(f"CRM API Count:   {crm_count}")
         print(f"DB Order Count:  {db_count}")
-        print(f"Match:           {api_db_pct:.2f}%   Threshold: {BLOB_DB_THRESHOLD * 100}%")
+        print(f"Difference:      {api_db_diff}   Allowed: {api_db_allowed:.2f} ({api_db_tol:.2f}%)")
         print(f"Status:          {'PASS' if api_db_pass else 'FAIL'}")
-        if not api_db_pass:
-            print(f"Difference:      {abs(crm_count - db_count)}")
 
         status = "PASS" if api_db_pass else "FAIL"
         print(f"\n{'='*60}\nVerification Status:     {status}\n{'='*60}\n")
@@ -1016,27 +1047,25 @@ def _verify_core(crm, target_date=None, dry_run=False, update_status=True):
             update_data_verified_status(crm.CLIENT_ID, False)
         return {"status": "ERROR", "client_id": crm.CLIENT_ID, "client_name": crm.CLIENT_NAME, "date": date_str, "error": "Failed to fetch blob data"}
 
-    # Step 3: Compare API count with Blob count (99% threshold)
+    # Step 3: Compare API count with Blob count (adaptive tolerance, one-sided).
     print(f"\n--- Step 3: API vs Blob Comparison ---")
     print(f"CRM API Count:           {crm_count}")
     print(f"Blob Total (deduped):    {blob_total}")
 
-    # Blob >= API is acceptable (extra line items / products per order)
-    # Only fail if blob is missing data compared to API
+    # Blob >= API is acceptable (extra line items / products per order) — one-sided:
+    # only a shortfall (blob short of API) beyond the allowed tolerance fails.
     if crm_count > 0:
         api_blob_pct = (blob_total / crm_count) * 100
     else:
         api_blob_pct = 100.0 if blob_total == 0 else 0.0
 
-    api_blob_pass = api_blob_pct >= (API_BLOB_THRESHOLD * 100)
+    api_blob_pass, shortfall, allowed, tol_pct = count_match(crm_count, blob_total, one_sided=True)
     print(f"Blob Coverage:           {api_blob_pct:.2f}%")
-    print(f"Threshold:               {API_BLOB_THRESHOLD * 100}%")
+    print(f"Missing in Blob:         {shortfall}   Allowed: {allowed:.2f} ({tol_pct:.2f}%)")
     print(f"Status:                  {'PASS' if api_blob_pass else 'FAIL'}")
 
     if not api_blob_pass:
-        diff = crm_count - blob_total
-        print(f"Missing in Blob:         {diff}")
-        print("FAILED: Blob coverage below threshold")
+        print("FAILED: Blob short beyond allowed tolerance")
         if update_status and not dry_run:
             update_data_verified_status(crm.CLIENT_ID, False)
         return {
@@ -1071,19 +1100,12 @@ def _verify_core(crm, target_date=None, dry_run=False, update_status=True):
     print(f"Blob Test Orders:        {blob_test}")
     print(f"DB Order Count:          {db_count}")
 
-    if blob_non_test > 0:
-        blob_db_pct = min(blob_non_test, db_count) / max(blob_non_test, db_count) * 100
-    else:
-        blob_db_pct = 100.0 if db_count == 0 else 0.0
-
-    blob_db_pass = blob_db_pct >= (BLOB_DB_THRESHOLD * 100)
+    ref = max(blob_non_test, db_count)
+    blob_db_pct = (min(blob_non_test, db_count) / ref * 100) if ref > 0 else 100.0
+    blob_db_pass, blob_db_diff, blob_db_allowed, blob_db_tol = count_match(ref, min(blob_non_test, db_count))
     print(f"Match Percentage:        {blob_db_pct:.2f}%")
-    print(f"Threshold:               {BLOB_DB_THRESHOLD * 100}%")
+    print(f"Difference:              {blob_db_diff}   Allowed: {blob_db_allowed:.2f} ({blob_db_tol:.2f}%)")
     print(f"Status:                  {'PASS' if blob_db_pass else 'FAIL'}")
-
-    if not blob_db_pass:
-        diff = abs(blob_non_test - db_count)
-        print(f"Difference:              {diff}")
 
     is_verified = blob_db_pass
     status = "PASS" if is_verified else "FAIL"
